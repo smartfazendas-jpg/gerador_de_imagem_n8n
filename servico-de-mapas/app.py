@@ -4,7 +4,7 @@ import geopandas as gpd
 import matplotlib
 
 # Importante: Define o backend do Matplotlib para 'Agg'.
-# Isso permite que ele rode em um servidor sem ambiente gráfico (sem tela).
+# Isso permite que ele rode em um servidor sem ambiente gr‚Ä°fico (sem tela).
 matplotlib.use('Agg')
 
 import matplotlib.pyplot as plt
@@ -12,74 +12,74 @@ import cartopy.crs as ccrs
 import cartopy.io.img_tiles as cimgt
 from flask import Flask, request, send_file, jsonify
 
-# --- Configuração Inicial ---
+# --- Configura¬ç‚Äπo Inicial ---
 
-# Habilita o driver KML no geopandas, que às vezes não vem ativado por padrão.
+# Habilita o driver KML no geopandas, que ÀÜs vezes n‚Äπo vem ativado por padr‚Äπo.
 gpd.io.file.fiona.drvsupport.supported_drivers['KML'] = 'rw'
 
-# Inicializa a aplicação web com Flask.
+# Inicializa a aplica¬ç‚Äπo web com Flask.
 app = Flask(__name__)
 
 
 # --- Endpoint da API ---
 
-# Define a rota '/generate-map' que aceitará requisições do tipo POST.
+# Define a rota '/generate-map' que aceitar‚Ä° requisi¬ç‚Ä∫es do tipo POST.
 @app.route('/generate-map', methods=['POST'])
 def generate_map_endpoint():
     try:
-        # Pega o conteúdo binário (o arquivo KML) enviado pelo n8n.
+        # Pega o conte≈ìdo bin‚Ä°rio (o arquivo KML) enviado pelo n8n.
         kml_data = request.data
         if not kml_data:
-            return jsonify({"error": "Corpo da requisição (KML) está vazio."}), 400
+            return jsonify({"error": "Corpo da requisi¬ç‚Äπo (KML) est‚Ä° vazio."}), 400
 
         print("Recebido KML. Lendo dados...")
-        # O geopandas lê o KML diretamente da memória, sem precisar salvar em disco.
+        # O geopandas l¬ê o KML diretamente da mem‚Äîria, sem precisar salvar em disco.
         gdf = gpd.read_file(io.BytesIO(kml_data), driver='KML')
 
-        # Garante que a projeção dos dados esteja no padrão geográfico (WGS84).
+        # Garante que a proje¬ç‚Äπo dos dados esteja no padr‚Äπo geogr‚Ä°fico (WGS84).
         gdf = gdf.to_crs(epsg=4326)
 
-        # Une todos os polígonos do KML em uma única geometria.
+        # Une todos os pol‚Äôgonos do KML em uma ≈ìnica geometria.
         imovel_geom = gdf.unary_union
 
         print("Preparando o mapa...")
-        # Define a fonte das imagens de fundo. Usaremos OpenStreetMap, que é aberto e não requer chave.
+        # Define a fonte das imagens de fundo. Usaremos OpenStreetMap, que ≈Ω aberto e n‚Äπo requer chave.
         imagery = cimgt.OSM()
 
-        # Cria a figura e o eixo do mapa com a projeção correta (Mercator).
+        # Cria a figura e o eixo do mapa com a proje¬ç‚Äπo correta (Mercator).
         fig = plt.figure(figsize=(10, 8))  # Define o tamanho da imagem (largura, altura em polegadas).
         ax = fig.add_subplot(1, 1, 1, projection=imagery.crs)
 
-        # Calcula a "caixa" (bounding box) que envolve o imóvel.
+        # Calcula a "caixa" (bounding box) que envolve o im‚Äîvel.
         bounds = imovel_geom.bounds  # Retorna (min_lon, min_lat, max_lon, max_lat)
         
-        # Adiciona uma margem de 10% para que o imóvel não fique colado nas bordas.
+        # Adiciona uma margem de 10% para que o im‚Äîvel n‚Äπo fique colado nas bordas.
         padding_x = (bounds[2] - bounds[0]) * 0.1
         padding_y = (bounds[3] - bounds[1]) * 0.1
         
         extent = [
-            bounds[0] - padding_x,  # Longitude mínima
-            bounds[2] + padding_x,  # Longitude máxima
-            bounds[1] - padding_y,  # Latitude mínima
-            bounds[3] + padding_y,  # Latitude máxima
+            bounds[0] - padding_x,  # Longitude m‚Äônima
+            bounds[2] + padding_x,  # Longitude m‚Ä°xima
+            bounds[1] - padding_y,  # Latitude m‚Äônima
+            bounds[3] + padding_y,  # Latitude m‚Ä°xima
         ]
-        # Define a área de visualização do mapa.
+        # Define a ‚Ä°rea de visualiza¬ç‚Äπo do mapa.
         ax.set_extent(extent, crs=ccrs.PlateCarree())
 
-        # Adiciona a imagem de satélite/mapa de fundo.
-        # O '12' é o nível de zoom dos tiles. Pode ser ajustado para mais/menos detalhes.
+        # Adiciona a imagem de sat≈Ωlite/mapa de fundo.
+        # O '12' ≈Ω o n‚Äôvel de zoom dos tiles. Pode ser ajustado para mais/menos detalhes.
         ax.add_image(imagery, 12, interpolation='spline36')
 
-        print("Desenhando o polígono...")
-        # Adiciona a geometria do imóvel por cima do mapa de fundo.
+        print("Desenhando o pol‚Äôgono...")
+        # Adiciona a geometria do im‚Äîvel por cima do mapa de fundo.
         ax.add_geometries([imovel_geom], crs=ccrs.PlateCarree(),
                           facecolor='yellow', edgecolor='yellow', linewidth=2, alpha=0.3)
 
-        # Salva a imagem gerada em um buffer na memória, em vez de um arquivo.
+        # Salva a imagem gerada em um buffer na mem‚Äîria, em vez de um arquivo.
         img_buffer = io.BytesIO()
         plt.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight', pad_inches=0)
-        plt.close(fig) # Libera a memória da figura.
-        img_buffer.seek(0) # Volta para o início do buffer.
+        plt.close(fig) # Libera a mem‚Äîria da figura.
+        img_buffer.seek(0) # Volta para o in‚Äôcio do buffer.
 
         print("Imagem gerada. Enviando resposta...")
         # Envia a imagem de volta para o n8n.
