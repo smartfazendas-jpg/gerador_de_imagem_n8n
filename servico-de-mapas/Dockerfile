@@ -1,23 +1,28 @@
-# Usa uma imagem oficial do Python como base. A vers‹o 'slim' Ž mais leve.
+# Usa uma imagem oficial do Python como base. A versão 'slim' é mais leve.
 FROM python:3.9-slim
 
-# Define o diret—rio de trabalho dentro do container.
+# Define o diretório de trabalho dentro do container.
 WORKDIR /app
 
-# Copia o arquivo com a lista de dependncias para dentro do container.
+# ✅ CORREÇÃO: Instala as dependências de sistema (GDAL e GEOS) antes de tudo.
+# Isso é crucial para que o geopandas e o cartopy funcionem corretamente.
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libgdal-dev \
+    libgeos-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copia o arquivo com a lista de dependências Python.
 COPY requirements.txt .
 
-# Instala as dependncias listadas no requirements.txt.
-# A instala‹o do cartopy pode levar alguns minutos.
-RUN apt-get update && apt-get install -y libgeos-dev && \
-    pip install --no-cache-dir -r requirements.txt
+# Agora, instala as bibliotecas Python.
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia todos os outros arquivos (o app.py) para o diret—rio de trabalho.
+# Copia o código da nossa aplicação.
 COPY . .
 
-# Exp›e a porta 80, que Ž a porta padr‹o para servios web no EasyPanel.
+# Expõe a porta 80.
 EXPOSE 80
 
-# O comando que ser‡ executado quando o container iniciar.
-# Ele inicia o servidor web Flask e o torna acess’vel a partir de outros servios.
+# Comando para iniciar o servidor web Flask.
 CMD ["flask", "run", "--host=0.0.0.0", "--port=80"]
