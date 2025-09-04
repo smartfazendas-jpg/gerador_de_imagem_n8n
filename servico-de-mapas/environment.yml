@@ -1,0 +1,10 @@
+name: gis-environment
+channels:
+  - conda-forge
+dependencies:
+  - python=3.9
+  - flask
+  - geopandas
+  - cartopy
+  - matplotlib
+  - pillow
