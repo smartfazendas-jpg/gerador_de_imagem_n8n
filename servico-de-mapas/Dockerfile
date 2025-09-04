@@ -5,13 +5,14 @@ FROM ghcr.io/osgeo/gdal:ubuntu-full-latest
 # Define o diretório de trabalho.
 WORKDIR /app
 
-# ✅ CORREÇÃO: Garante que o pip para Python 3 está instalado.
+# A imagem base já vem com Python e pip.
+# Garante que o pip para Python 3 está instalado e atualizado.
 RUN apt-get update && apt-get install -y python3-pip
 
 # Copia a nossa lista de dependências Python.
 COPY requirements.txt .
 
-# ✅ CORREÇÃO: Usa o comando 'pip3' em vez de 'pip'.
+# Instala as bibliotecas Python.
 # O --break-system-packages é necessário em imagens mais novas para permitir a instalação via pip.
 RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 
