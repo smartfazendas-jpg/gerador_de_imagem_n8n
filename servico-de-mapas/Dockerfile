@@ -1,5 +1,5 @@
-# ✅ CORREÇÃO: Usa uma imagem oficial e específica do OSGeo/GDAL que existe.
-FROM osgeo/gdal:ubuntu-full-3.8.4-python3.10
+# ✅ CORREÇÃO FINAL: Usa a imagem estável e mais recente do OSGeo/GDAL baseada em Ubuntu.
+FROM osgeo/gdal:ubuntu-full
 
 # Instala o pip, o gerenciador de pacotes do Python.
 RUN apt-get update && apt-get install -y python3-pip
