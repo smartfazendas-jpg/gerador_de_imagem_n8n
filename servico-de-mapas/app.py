@@ -4,7 +4,6 @@ import geopandas as gpd
 import matplotlib
 
 # Importante: Define o backend do Matplotlib para 'Agg'.
-# Isso permite que ele rode em um servidor sem ambiente gr‡fico (sem tela).
 matplotlib.use('Agg')
 
 import matplotlib.pyplot as plt
@@ -12,80 +11,58 @@ import cartopy.crs as ccrs
 import cartopy.io.img_tiles as cimgt
 from flask import Flask, request, send_file, jsonify
 
-# --- Configura‹o Inicial ---
+# --- Configuração Inicial ---
 
-# Habilita o driver KML no geopandas, que ˆs vezes n‹o vem ativado por padr‹o.
-gpd.io.file.fiona.drvsupport.supported_drivers['KML'] = 'rw'
+# ✅ CORREÇÃO: A linha problemática foi REMOVIDA.
+# Versões modernas do Geopandas não precisam mais disso e a linha estava causando o erro.
+# gpd.io.file.fiona.drvsupport.supported_drivers['KML'] = 'rw'
 
-# Inicializa a aplica‹o web com Flask.
+# Inicializa a aplicação web com Flask.
 app = Flask(__name__)
 
 
 # --- Endpoint da API ---
 
-# Define a rota '/generate-map' que aceitar‡ requisi›es do tipo POST.
 @app.route('/generate-map', methods=['POST'])
 def generate_map_endpoint():
     try:
-        # Pega o conteœdo bin‡rio (o arquivo KML) enviado pelo n8n.
         kml_data = request.data
         if not kml_data:
-            return jsonify({"error": "Corpo da requisi‹o (KML) est‡ vazio."}), 400
+            return jsonify({"error": "Corpo da requisição (KML) está vazio."}), 400
 
         print("Recebido KML. Lendo dados...")
-        # O geopandas l o KML diretamente da mem—ria, sem precisar salvar em disco.
+        # Lemos o KML diretamente da memória. O Geopandas encontrará o driver KML automaticamente.
         gdf = gpd.read_file(io.BytesIO(kml_data), driver='KML')
 
-        # Garante que a proje‹o dos dados esteja no padr‹o geogr‡fico (WGS84).
         gdf = gdf.to_crs(epsg=4326)
-
-        # Une todos os pol’gonos do KML em uma œnica geometria.
         imovel_geom = gdf.unary_union
 
         print("Preparando o mapa...")
-        # Define a fonte das imagens de fundo. Usaremos OpenStreetMap, que Ž aberto e n‹o requer chave.
         imagery = cimgt.OSM()
 
-        # Cria a figura e o eixo do mapa com a proje‹o correta (Mercator).
-        fig = plt.figure(figsize=(10, 8))  # Define o tamanho da imagem (largura, altura em polegadas).
+        fig = plt.figure(figsize=(10, 8))
         ax = fig.add_subplot(1, 1, 1, projection=imagery.crs)
 
-        # Calcula a "caixa" (bounding box) que envolve o im—vel.
-        bounds = imovel_geom.bounds  # Retorna (min_lon, min_lat, max_lon, max_lat)
-        
-        # Adiciona uma margem de 10% para que o im—vel n‹o fique colado nas bordas.
+        bounds = imovel_geom.bounds
         padding_x = (bounds[2] - bounds[0]) * 0.1
         padding_y = (bounds[3] - bounds[1]) * 0.1
-        
-        extent = [
-            bounds[0] - padding_x,  # Longitude m’nima
-            bounds[2] + padding_x,  # Longitude m‡xima
-            bounds[1] - padding_y,  # Latitude m’nima
-            bounds[3] + padding_y,  # Latitude m‡xima
-        ]
-        # Define a ‡rea de visualiza‹o do mapa.
+        extent = [bounds[0] - padding_x, bounds[2] + padding_x, bounds[1] - padding_y, bounds[3] + padding_y]
         ax.set_extent(extent, crs=ccrs.PlateCarree())
 
-        # Adiciona a imagem de satŽlite/mapa de fundo.
-        # O '12' Ž o n’vel de zoom dos tiles. Pode ser ajustado para mais/menos detalhes.
         ax.add_image(imagery, 12, interpolation='spline36')
 
-        print("Desenhando o pol’gono...")
-        # Adiciona a geometria do im—vel por cima do mapa de fundo.
+        print("Desenhando polígono...")
         ax.add_geometries([imovel_geom], crs=ccrs.PlateCarree(),
                           facecolor='yellow', edgecolor='yellow', linewidth=2, alpha=0.3)
 
-        # Salva a imagem gerada em um buffer na mem—ria, em vez de um arquivo.
         img_buffer = io.BytesIO()
         plt.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight', pad_inches=0)
-        plt.close(fig) # Libera a mem—ria da figura.
-        img_buffer.seek(0) # Volta para o in’cio do buffer.
+        plt.close(fig)
+        img_buffer.seek(0)
 
         print("Imagem gerada. Enviando resposta...")
-        # Envia a imagem de volta para o n8n.
         return send_file(img_buffer, mimetype='image/png')
 
     except Exception as e:
-        # Se qualquer erro acontecer, imprime no log e retorna uma mensagem de erro clara.
         print(f"Erro no processamento: {e}")
         return jsonify({"error": str(e)}), 500
