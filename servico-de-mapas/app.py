@@ -29,9 +29,8 @@ def generate_map_endpoint():
 
         print("Recebido KML. Lendo dados...")
         
-        # Habilita o driver KML (forma segura dentro da função)
-        with gpd.io.file.fiona.Env():
-            gdf = gpd.read_file(io.BytesIO(kml_data), driver='KML')
+        # Com o ambiente correto, o Geopandas ativa o driver KML automaticamente.
+        gdf = gpd.read_file(io.BytesIO(kml_data), driver='KML')
 
         # Garante que a projeção dos dados esteja no padrão geográfico (WGS84).
         gdf = gdf.to_crs(epsg=4326)
