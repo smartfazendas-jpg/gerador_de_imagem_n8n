@@ -1,28 +1,24 @@
-# Usa uma imagem oficial do Python como base. A versão 'slim' é mais leve.
-FROM python:3.9-slim
+# Usa uma imagem oficial do Miniconda como base, que é leve e vem com o Conda.
+FROM continuumio/miniconda3
 
-# Define o diretório de trabalho dentro do container.
+# Define o diretório de trabalho.
 WORKDIR /app
 
-# ✅ CORREÇÃO: Instala as dependências de sistema (GDAL e GEOS) antes de tudo.
-# Isso é crucial para que o geopandas e o cartopy funcionem corretamente.
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    libgdal-dev \
-    libgeos-dev \
-    && rm -rf /var/lib/apt/lists/*
+# Copia o nosso novo arquivo de ambiente para o container.
+COPY environment.yml .
 
-# Copia o arquivo com a lista de dependências Python.
-COPY requirements.txt .
+# O comando mágico: O Conda lê o arquivo e instala TUDO (Python, GDAL, Geopandas, etc.)
+# em um ambiente isolado e 100% compatível. Isso pode demorar vários minutos.
+RUN conda env create -f environment.yml
 
-# Agora, instala as bibliotecas Python.
-RUN pip install --no-cache-dir -r requirements.txt
+# Define o shell para usar o ambiente que acabamos de criar.
+SHELL ["conda", "run", "-n", "gis-environment", "/bin/bash", "-c"]
 
-# Copia o código da nossa aplicação.
+# Copia o resto do nosso código (o app.py).
 COPY . .
 
 # Expõe a porta 80.
 EXPOSE 80
 
-# Comando para iniciar o servidor web Flask.
-CMD ["flask", "run", "--host=0.0.0.0", "--port=80"]
+# Comando para iniciar o servidor Flask usando o ambiente Conda correto.
+CMD ["conda", "run", "-n", "gis-environment", "flask", "run", "--host=0.0.0.0", "--port=80"]
