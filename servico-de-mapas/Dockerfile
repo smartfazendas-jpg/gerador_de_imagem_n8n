@@ -1,5 +1,5 @@
-# Usa a imagem oficial do OSGeo/GDAL que já vem com Python 3.9 e TODO o ambiente GIS.
-FROM osgeo/gdal:python3.9-ubuntu-full
+# ✅ CORREÇÃO: Usa uma imagem oficial e específica do OSGeo/GDAL que existe.
+FROM osgeo/gdal:ubuntu-full-3.8.4-python3.10
 
 # Instala o pip, o gerenciador de pacotes do Python.
 RUN apt-get update && apt-get install -y python3-pip
@@ -11,7 +11,6 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Agora, instala as bibliotecas Python usando pip.
-# Como o ambiente já está preparado, a instalação será bem-sucedida.
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copia o código da nossa aplicação.
