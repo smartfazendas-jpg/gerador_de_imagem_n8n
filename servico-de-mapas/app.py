@@ -1,3 +1,4 @@
+# app.py
 import os, io, json, base64, math, logging, random, requests
 import geopandas as gpd
 import matplotlib
@@ -205,13 +206,14 @@ def generate_map():
                                  facecolor=(1,1,0,0.25),
                                  edgecolor=(1,1,0,0.95), linewidth=2.2, zorder=7)
         for c in ax.collections[-1:]:
-            c.set_path_effects([patheffects.Stroke(linewidth=3.8, foreground='black'), patheffects.Normal()])
+            c.set_path_effects([pe.Stroke(linewidth=3.8, foreground='black'), pe.Normal()])
 
         # Pino
         try:
             pt = geom.representative_point()
             ax.scatter([pt.x], [pt.y], transform=ccrs.PlateCarree(),
-                       s=70, zorder=8, marker='o', facecolor=BRAND_COLOR, edgecolor='white', linewidth=1.5)
+                       s=70, zorder=8, marker='o',
+                       facecolor=BRAND_COLOR, edgecolor='white', linewidth=1.5)
         except Exception:
             pt = None
 
@@ -220,7 +222,7 @@ def generate_map():
         cx, cy = geom.centroid.x, geom.centroid.y
         txt = ax.text(cx, cy, label_text, transform=ccrs.PlateCarree(),
                       fontsize=10, color='white', rotation=angle, ha='center', va='center', zorder=9)
-        txt.set_path_effects([patheffects.withStroke(linewidth=2.8, foreground='black')])
+        txt.set_path_effects([pe.withStroke(linewidth=2.8, foreground='black')])
 
         # Coordenadas
         if show_coords:
@@ -229,12 +231,12 @@ def generate_map():
             else:
                 lat, lon = geom.centroid.y, geom.centroid.x
             fig.text(0.02, 0.06, f"{lat:.5f}, {lon:.5f}", fontsize=8, color='white',
-                     path_effects=[patheffects.withStroke(linewidth=2.5, foreground='black')])
+                     path_effects=[pe.withStroke(linewidth=2.5, foreground='black')])
 
         # Atribuição e logo
         ax.set_axis_off()
         fig.text(0.01, 0.01, f"© {provider_name}", fontsize=6, color='white',
-                 path_effects=[patheffects.withStroke(linewidth=2.0, foreground='black')])
+                 path_effects=[pe.withStroke(linewidth=2.0, foreground='black')])
         _add_logo(ax, _load_logo(logo_url), width_px=220)
 
         fig.tight_layout(pad=0)
