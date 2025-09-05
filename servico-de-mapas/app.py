@@ -1,11 +1,12 @@
 # app.py
-import io, os, math, logging, json
+import io, os, math, logging
 from datetime import datetime
+
 import requests
 from PIL import Image
 
 import geopandas as gpd
-from shapely.geometry import box, Point
+from shapely.geometry import box, Point, Polygon, MultiPolygon
 from shapely.ops import unary_union
 
 import matplotlib
@@ -19,35 +20,46 @@ import cartopy.io.img_tiles as cimgt
 
 from flask import Flask, request, jsonify, send_file
 
+# Tenta carregar fastkml para fallback de parsing KML
+try:
+    from fastkml import kml as fastkml
+    HAS_FASTKML = True
+except Exception:
+    HAS_FASTKML = False
+
 # --------------------
 # Configurações globais
 # --------------------
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger("map-croqui")
-DEFAULT_FIG_ASPECT = 1.33  # 4:3 padrao
+
+DEFAULT_FIG_ASPECT = 1.33  # 4:3 padrão (paisagem)
 DEFAULT_DPI = 150
+
 DEFAULT_POLY_ALPHA = 0.28
-DEFAULT_POLY_EDGE = "#ffd54f"  # amarelo quente
-DEFAULT_POLY_FACE = "#ffeb3b"
+DEFAULT_POLY_EDGE = "#ffd54f"   # amarelo borda
+DEFAULT_POLY_FACE = "#ffeb3b"   # amarelo face
 DEFAULT_EDGE_WIDTH = 3.0
+
 DEFAULT_DARKEN = 0.35
 DEFAULT_JPG_QUALITY = 82
+
 LOGO_URL_DEFAULT = "https://raw.githubusercontent.com/rodrigocoladello/logomarca/main/Logo%20Smart%20Fazendas%20Roxo.png"
+
+# Token do Mapbox (para Google Hybrid fallback via estilo satellite-streets)
+MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN", "").strip()
 
 # ------------
 # Tiles Mapbox
 # ------------
-MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN", "").strip()
-
 class MapboxTiles(cimgt.GoogleTiles):
     """
-    Usa infra do GoogleTiles (gestão de tiles) mas customiza a URL xyz.
+    Usa a base do GoogleTiles para gerenciar quadros, mas com URL XYZ customizada (Mapbox).
     """
     def __init__(self, url_template, cache=False):
         self._url_template = url_template
         super().__init__()
-        # evitar rate-limit agressivo
-        self.desired_tile_form = 'RGB'
+        self.desired_tile_form = "RGB"
         self.cache = cache
 
     def _image_url(self, tile):
@@ -58,16 +70,15 @@ def get_tile_provider(name: str):
     name = (name or "").lower()
     if name in ("google_hybrid", "mapbox_satellite_streets"):
         if not MAPBOX_TOKEN:
-            LOGGER.warning("MAPBOX_TOKEN ausente -> fallback OSM")
-            return cimgt.OSM(), "OSM"
-        # Mapbox Satellite + streets (labels) = "satellite-streets-v12"
+            LOGGER.warning("MAPBOX_TOKEN ausente -> fallback para OSM.")
+            return cimgt.OSM(), "OpenStreetMap"
         url = (
             "https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/"
             "tiles/256/{z}/{x}/{y}?access_token=" + MAPBOX_TOKEN
         )
-        return MapboxTiles(url), "Mapbox Satellite-Streets"
+        return MapboxTiles(url), "Google Hybrid"
     # fallback
-    return cimgt.OSM(), "OSM"
+    return cimgt.OSM(), "OpenStreetMap"
 
 # -------------------------
 # Utilitários de geometria
@@ -83,72 +94,123 @@ def safe_unary_union(gdf):
         return merged
 
 def pad_extent(bounds, pad_frac=0.10):
-    minx, miny, maxx, maxy = bounds  # shapely bounds: (minx, miny, maxx, maxy)
+    # bounds shapely: (minx, miny, maxx, maxy) -> retorna [minx, maxx, miny, maxy]
+    minx, miny, maxx, maxy = bounds
     dx, dy = (maxx - minx), (maxy - miny)
     if dx <= 0 or dy <= 0:
         return [minx, maxx, miny, maxy]
     return [minx - dx*pad_frac, maxx + dx*pad_frac, miny - dy*pad_frac, maxy + dy*pad_frac]
 
-# --- Converte lon/lat <-> WebMercator metros (para equalizar aspecto corretamente) ---
-def _mx(lon):  # lon -> mercator x
+# --- Conversões lon/lat <-> WebMercator (m) para forçar aspecto corretamente ---
+def _mx(lon):  # lon -> x
     return 6378137.0 * math.radians(lon)
 
-def _my(lat):  # lat -> mercator y
+def _my(lat):  # lat -> y
     lat = max(-85.05112878, min(85.05112878, lat))
     return 6378137.0 * math.log(math.tan(math.pi/4 + math.radians(lat)/2))
 
-def _lon(mx):  # mercator x -> lon
+def _lon(mx):  # x -> lon
     return math.degrees(mx / 6378137.0)
 
-def _lat(my):  # mercator y -> lat
+def _lat(my):  # y -> lat
     return math.degrees(2*math.atan(math.exp(my/6378137.0)) - math.pi/2)
 
-def enforce_extent_aspect(extent84, target_aspect):
+def enforce_extent_aspect(ext84, target_aspect):
     """
-    Expande simetricamente o extent WGS84 para atingir razão L/H = target_aspect em 3857.
-    extent84 = [minx, maxx, miny, maxy] (lon/lat)
+    Expande simetricamente o extent WGS84 para atingir L/H = target_aspect em 3857.
+    ext84 = [minx, maxx, miny, maxy] (lon/lat)
     """
-    minlon, maxlon, minlat, maxlat = extent84
+    minlon, maxlon, minlat, maxlat = ext84
     xmin, xmax = _mx(minlon), _mx(maxlon)
     ymin, ymax = _my(minlat), _my(maxlat)
     w, h = (xmax - xmin), (ymax - ymin)
     if w <= 0 or h <= 0:
-        return extent84
+        return ext84
     cur = w / h
     cx, cy = (xmin + xmax)/2.0, (ymin + ymax)/2.0
     if cur < target_aspect:
-        # “muito alto” -> alarga largura
+        # muito alto -> alarga largura
         new_w = target_aspect * h
         xmin, xmax = cx - new_w/2.0, cx + new_w/2.0
     elif cur > target_aspect:
-        # “muito largo” -> aumenta altura
+        # muito largo -> aumenta altura
         new_h = w / target_aspect
         ymin, ymax = cy - new_h/2.0, cy + new_h/2.0
     return [_lon(xmin), _lon(xmax), _lat(ymin), _lat(ymax)]
 
 def set_figure_aspect(fig: Figure, aspect: float):
-    """Define tamanho da figura em polegadas para manter aspecto alvo (paisagem)."""
+    """Define o tamanho da figura em polegadas para manter aspecto alvo (paisagem)."""
     H = 9.0
     W = max(8.0, min(20.0, H * aspect))
     fig.set_size_inches(W, H, forward=True)
 
 def estimate_zoom(extent84, base_width_px=1600):
-    """
-    Estima nível de zoom para tiles WebMercator a partir do span em longitude.
-    Heurístico simples, clamped.
-    """
+    """Heurística simples para zoom WebMercator a partir do span em longitude."""
     minx, maxx, _, _ = extent84
     span_deg = max(0.0005, maxx - minx)
     z = math.log2((360.0 * base_width_px) / (256.0 * span_deg))
     return int(max(7, min(18, round(z))))
+
+# -------------------------
+# KML -> GeoDataFrame (robusto)
+# -------------------------
+def gdf_from_kml_string(kml_str: str) -> gpd.GeoDataFrame:
+    """
+    Tenta ler via GDAL/Fiona (driver KML). Se o driver não existir, usa fastkml.
+    Retorna GeoDataFrame em EPSG:4326.
+    """
+    # 1) tentativa com GDAL/Fiona (se o driver existir)
+    try:
+        gdf = gpd.read_file(io.BytesIO(kml_str.encode("utf-8")), driver="KML")
+        if not gdf.empty:
+            return gdf.to_crs(4326)
+    except Exception as e:
+        msg = str(e).lower()
+        if "unsupported driver" not in msg and "kml" not in msg:
+            # outro erro qualquer; ainda vamos tentar fastkml
+            LOGGER.info(f"read_file(driver='KML') falhou: {e}")
+
+    # 2) fallback com fastkml
+    if not HAS_FASTKML:
+        raise RuntimeError("unsupported driver: 'KML' (e fastkml não está instalado)")
+
+    k = fastkml.KML()
+    k.from_string(kml_str.encode("utf-8"))
+
+    def _iter_geoms(feat):
+        # Caminha pela árvore de features do KML e retorna geometrias shapely
+        if hasattr(feat, "features"):
+            for f in feat.features():
+                yield from _iter_geoms(f)
+        else:
+            geom = getattr(feat, "geometry", None)
+            if geom is not None:
+                yield geom
+
+    geoms = []
+    for feat in k.features():
+        geoms.extend(list(_iter_geoms(feat)))
+
+    # filtra polígonos/multipolígonos (o que nos interessa para o croqui)
+    polys = []
+    for g in geoms:
+        if isinstance(g, (Polygon, MultiPolygon)):
+            polys.append(g)
+        # Se vier MultiGeometry, fastkml já converte para shapely adequado.
+
+    if not polys:
+        raise RuntimeError("KML sem geometrias poligonais (fastkml).")
+
+    gdf = gpd.GeoDataFrame(geometry=polys, crs="EPSG:4326")
+    return gdf
 
 # --------------------
 # Render helpers (plot)
 # --------------------
 def draw_logo_figimage(fig: Figure, logo_url: str, scale: float = 0.18, margin_px: int = 30):
     """
-    Desenha a logo no canto superior direito em coordenadas da FIGURA (não do eixo),
-    então não sofre escurecimento do eixo.
+    Desenha a logo no canto superior direito em coordenadas da FIGURA (fora do eixo),
+    então não sofre o escurecimento aplicado no eixo/cartopy.
     """
     try:
         resp = requests.get(logo_url, timeout=10)
@@ -159,17 +221,17 @@ def draw_logo_figimage(fig: Figure, logo_url: str, scale: float = 0.18, margin_p
         return
 
     # dimensiona pela largura da figura
-    fig.canvas.draw()  # garante dimensões em px
+    fig.canvas.draw()
     fw, fh = fig.canvas.get_width_height()
     target_w = int(fw * scale)
     ratio = target_w / img.width
     target_h = int(img.height * ratio)
     img = img.resize((target_w, target_h), Image.LANCZOS)
 
-    # posição topo-direita
+    # topo-direito
     x = fw - target_w - margin_px
     y = fh - target_h - margin_px
-    fig.figimage(img, xo=x, yo=y, zorder=50)  # acima de tudo
+    fig.figimage(img, xo=x, yo=y, zorder=50)
 
 def draw_corner_label(ax, text, xy_data, crs, fontsize=10):
     ax.text(
@@ -198,9 +260,10 @@ def health():
     if diag:
         res.update({
             "versions": {
-                "cartopy": cimgt.__version__ if hasattr(cimgt, "__version__") else "unknown",
                 "geopandas": gpd.__version__,
                 "matplotlib": matplotlib.__version__,
+                "cartopy": getattr(cimgt, "__version__", "unknown"),
+                "fastkml": "ok" if HAS_FASTKML else "missing"
             },
             "has_imgtiles": hasattr(cimgt, "OSM"),
             "tile_provider_selected": prov_name,
@@ -225,7 +288,8 @@ def generate_map():
         if not kml_str:
             return jsonify({"error": "Campo 'data' (KML) não encontrado"}), 400
 
-        gdf = gpd.read_file(io.BytesIO(kml_str.encode("utf-8")), driver="KML")
+        # ---- robusto: lê KML com fallback fastkml
+        gdf = gdf_from_kml_string(kml_str)
         if gdf.empty or gdf.geometry.is_empty.all():
             return jsonify({"error": "KML sem geometrias"}), 400
 
@@ -239,10 +303,13 @@ def generate_map():
         # -------------------
         q = request.args
         provider_name = q.get("provider", "google_hybrid")
+
         darken = max(0.0, min(0.9, float(q.get("darken", DEFAULT_DARKEN))))
         poly_alpha = max(0.0, min(1.0, float(q.get("poly_alpha", DEFAULT_POLY_ALPHA))))
         edge_w = max(0.5, min(8.0, float(q.get("edge_width", DEFAULT_EDGE_WIDTH))))
+
         label_text = q.get("label", "").strip()
+
         jpg_quality = int(q.get("jpg_quality", DEFAULT_JPG_QUALITY))
         jpg_quality = min(95, max(50, jpg_quality))
 
@@ -262,18 +329,15 @@ def generate_map():
         logo_scale = float(q.get("logo_scale", 0.16))
 
         # -------------------
-        # Extent alvo + aspecto 4:3 fixo
+        # Extent alvo + aspecto 4:3 fixo (paisagem)
         # -------------------
-        # bounds shapely -> (minx, miny, maxx, maxy); convert to [minx, maxx, miny, maxy]
-        b = geom.bounds
-        extent84 = pad_extent((b[0], b[1], b[2], b[3]), pad_frac=0.10)
-        extent84 = [extent84[0], extent84[2], extent84[1], extent84[3]]  # [minx,maxx,miny,maxy] (lon/lat)
-
-        # força 4:3
+        b = geom.bounds  # (minx, miny, maxx, maxy)
+        extent84 = pad_extent(b, pad_frac=0.10)  # [minx,maxx,miny,maxy]
+        extent84 = [extent84[0], extent84[1], extent84[2], extent84[3]]
         extent84 = enforce_extent_aspect(extent84, DEFAULT_FIG_ASPECT)
 
         # -------------------
-        # Figura + eixo (sem margens/brancos)
+        # Figura + eixo sem margens/brancos
         # -------------------
         fig = Figure(dpi=DEFAULT_DPI)
         set_figure_aspect(fig, DEFAULT_FIG_ASPECT)
@@ -290,9 +354,8 @@ def generate_map():
         ax.set_extent(extent84, crs=ccrs.PlateCarree())
 
         # -------------------
-        # Escurecer APENAS fora do polígono (máscara)
+        # Escurecer APENAS fora do polígono
         # -------------------
-        # extent como retângulo WGS84
         full_rect = box(extent84[0], extent84[2], extent84[1], extent84[3])
         outside = full_rect.difference(geom)
         if not outside.is_empty and darken > 0:
@@ -318,9 +381,8 @@ def generate_map():
             zorder=10
         )
 
-        # etiqueta do imóvel (se houver)
+        # etiqueta do imóvel (fallback por colunas conhecidas)
         if not label_text:
-            # tenta construir a partir de atributos comuns
             for col in ["cod_imovel", "CAR", "car", "cod", "name", "Nome"]:
                 if col in gdf.columns and isinstance(gdf.iloc[0][col], str):
                     label_text = gdf.iloc[0][col]
@@ -351,7 +413,7 @@ def generate_map():
                 fontsize=12
             )
 
-        # rodapé com crédito do provedor (discreto)
+        # rodapé com crédito do provedor
         ll = (extent84[0] + 0.005*(extent84[1]-extent84[0]),
               extent84[2] + 0.008*(extent84[3]-extent84[2]))
         draw_corner_label(ax, f"© {prov_label}", ll, ccrs.PlateCarree(), fontsize=8)
@@ -360,7 +422,7 @@ def generate_map():
         draw_logo_figimage(fig, logo_url=logo_url, scale=logo_scale)
 
         # -------------------
-        # Exportar para JPEG
+        # Exportar JPEG
         # -------------------
         # 1) salva PNG no buffer
         png_buf = io.BytesIO()
@@ -368,7 +430,7 @@ def generate_map():
         plt.close(fig)
         png_buf.seek(0)
 
-        # 2) converte para JPEG com qualidade controlada
+        # 2) converte para JPEG
         im = Image.open(png_buf).convert("RGB")
         jpg_buf = io.BytesIO()
         im.save(jpg_buf, format="JPEG", quality=jpg_quality, optimize=True, progressive=True)
@@ -379,6 +441,7 @@ def generate_map():
 
     except Exception as e:
         LOGGER.exception("Erro no processamento")
+        # Devolve msg curta, mas com detalhe útil
         return jsonify({"error": str(e)}), 500
 
 # -------------
