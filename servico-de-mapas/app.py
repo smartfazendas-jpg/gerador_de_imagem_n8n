@@ -166,21 +166,21 @@ def estimate_zoom(extent84, base_width_px=1600):
 def gdf_from_kml_string(kml_str: str) -> gpd.GeoDataFrame:
     """
     Lê KML e devolve GeoDataFrame (EPSG:4326).
-    1) GDAL/Fiona (driver KML)
-    2) fastkml (robusto, lida com .features método ou lista)
-    3) XML manual AGNÓSTICO de namespace (varre por localname: Polygon/LinearRing/coordinates)
+    Ordem de tentativa:
+      1) GDAL/Fiona (driver KML)
+      2) fastkml (robusto, trata .features como método OU lista)
+      3) XML manual agnóstico de namespace (varre por localname)
     """
-    # 1) GDAL/Fiona
+    # 1) GDAL/Fiona (quando o driver KML estiver presente)
     try:
         gdf = gpd.read_file(io.BytesIO(kml_str.encode("utf-8")), driver="KML")
         if not gdf.empty:
             return gdf.to_crs(4326)
     except Exception as e:
-        msg = str(e).lower()
-        if "unsupported driver" not in msg and "kml" not in msg:
-            LOGGER.info(f"read_file(driver='KML') falhou: {e}")
+        # Apenas loga e segue para o fallback (sem testar 'in' na msg)
+        LOGGER.info(f"read_file(driver='KML') falhou, usando fallback: {e}")
 
-    # 2) fastkml
+    # 2) Fallback fastkml
     if HAS_FASTKML:
         try:
             from shapely.geometry import Polygon, MultiPolygon
@@ -204,7 +204,7 @@ def gdf_from_kml_string(kml_str: str) -> gpd.GeoDataFrame:
                         yield f
 
             geoms = []
-            stack = list(iter_children(k))  # nada de k.features() direto
+            stack = list(iter_children(k))  # não usar k.features() direto
             while stack:
                 f = stack.pop()
                 geom = getattr(f, "geometry", None)
@@ -227,7 +227,104 @@ def gdf_from_kml_string(kml_str: str) -> gpd.GeoDataFrame:
             if polys:
                 return gpd.GeoDataFrame(geometry=polys, crs="EPSG:4326")
         except Exception as e:
-            LOGGER.info(f"fastkml fallback falhou: {e}")
+            LOGGER.info(f"fastkml fallback falhou, usando parser XML: {e}")
+
+    # 3) Fallback final: XML manual (agnóstico de namespace/localname)
+    import xml.etree.ElementTree as ET
+    from shapely.geometry import Polygon
+
+    def _localname(tag):
+        return tag.split('}')[-1] if isinstance(tag, str) else tag
+
+    def _parse_coords(text):
+        out = []
+        if not text:
+            return out
+        for token in text.replace("\n", " ").replace("\t", " ").split():
+            parts = token.split(",")
+            if len(parts) >= 2:
+                try:
+                    lon = float(parts[0]); lat = float(parts[1])
+                    out.append((lon, lat))
+                except ValueError:
+                    continue
+        return out
+
+    def _find_first_local(parent, name):
+        for el in parent.iter():
+            if _localname(el.tag) == name:
+                return el
+        return None
+
+    def _find_all_local(parent, name):
+        for el in parent.iter():
+            if _localname(el.tag) == name:
+                yield el
+
+    try:
+        root = ET.fromstring(kml_str.encode("utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"KML inválido (XML). {e}")
+
+    polys = []
+    for poly in root.iter():
+        if _localname(poly.tag) != "Polygon":
+            continue
+
+        # OUTER
+        outer = _find_first_local(poly, "outerBoundaryIs")
+        outer_coords = []
+        if outer is not None:
+            lr = _find_first_local(outer, "LinearRing")
+            if lr is not None:
+                coords_el = _find_first_local(lr, "coordinates")
+                if coords_el is not None:
+                    outer_coords = _parse_coords(coords_el.text)
+
+        # INNERS
+        holes = []
+        for ib in _find_all_local(poly, "innerBoundaryIs"):
+            lr = _find_first_local(ib, "LinearRing")
+            if lr is not None:
+                coords_el = _find_first_local(lr, "coordinates")
+                if coords_el is not None:
+                    ic = _parse_coords(coords_el.text)
+                    if len(ic) >= 3:
+                        if ic[0] != ic[-1]:
+                            ic.append(ic[0])
+                        holes.append(ic)
+
+        if len(outer_coords) >= 3:
+            if outer_coords[0] != outer_coords[-1]:
+                outer_coords.append(outer_coords[0])
+            try:
+                p = Polygon(outer_coords, holes)
+                if p.is_valid and not p.is_empty and p.area > 0:
+                    polys.append(p)
+            except Exception:
+                pass
+
+    if not polys:
+        # Último recurso: qualquer <coordinates> fechado
+        coords_texts = [el.text for el in root.iter() if _localname(el.tag) == "coordinates" and el.text]
+        for txt in coords_texts:
+            pts = _parse_coords(txt)
+            if len(pts) >= 3:
+                if pts[0] != pts[-1]:
+                    pts.append(pts[0])
+                try:
+                    p = Polygon(pts)
+                    if p.is_valid and not p.is_empty and p.area > 0:
+                        polys.append(p)
+                        break
+                except Exception:
+                    pass
+
+    if not polys:
+        raise RuntimeError("KML sem geometrias poligonais (parser XML).")
+
+    return gpd.GeoDataFrame(geometry=polys, crs="EPSG:4326")
+
 
     # 3) XML manual agnóstico de namespace
     import xml.etree.ElementTree as ET
