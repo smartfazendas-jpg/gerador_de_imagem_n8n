@@ -3,3 +3,4 @@ geopandas
 cartopy
 matplotlib
 Pillow
+numpy
