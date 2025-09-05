@@ -103,49 +103,95 @@ def _read_kml_gdf(kml_bytes):
         except Exception:
             pass
 
-    # 2) Fallback: fastkml (sem GDAL)
-    if fastkml_mod is None:
-        raise RuntimeError(
-            "Drivers GDAL KML/LIBKML indisponíveis e 'fastkml' não instalado. "
-            "Inclua 'fastkml' na imagem."
-        )
+    # 2) Fallback: fastkml (quando disponível)
+    if fastkml_mod is not None:
+        try:
+            k = fastkml_mod.KML()
+            k.from_string(kml_bytes)
 
-    k = fastkml_mod.KML()
-    k.from_string(kml_bytes)
+            from shapely.geometry import shape
+            geoms_fk, props_fk = [], []
 
-    from shapely.geometry import shape
+            def iter_children(node):
+                feats = getattr(node, "features", None)
+                if feats is None:
+                    return []
+                return list(feats() if callable(feats) else feats)
+
+            def walk(node):
+                children = iter_children(node)
+                if not children:
+                    yield node
+                else:
+                    for ch in children:
+                        yield from walk(ch)
+
+            for f in walk(k):
+                geom = getattr(f, "geometry", None)
+                if geom:
+                    geoms_fk.append(shape(geom.__geo_interface__))
+                    p = {}
+                    ed = getattr(f, "extended_data", None)
+                    if ed:
+                        for el in getattr(ed, "elements", []):
+                            p[el.name] = el.value
+                    props_fk.append(p)
+
+            if geoms_fk:
+                return gpd.GeoDataFrame(props_fk, geometry=geoms_fk, crs="EPSG:4326")
+        except Exception:
+            pass  # cai para o fallback XML
+
+    # 3) Fallback final: parsing XML "puro" (Polygon/LinearRing/coordinates)
+    import xml.etree.ElementTree as ET
+    from shapely.geometry import Polygon
+
+    try:
+        root = ET.fromstring(kml_bytes)
+    except Exception as e:
+        raise RuntimeError(f"Falha ao parsear KML (XML): {e}")
+
+    K = "{http://www.opengis.net/kml/2.2}"
     geoms, props = [], []
 
-    def iter_children(node):
-        """Suporta fastkml onde `features` pode ser método OU lista."""
-        feats = getattr(node, "features", None)
-        if feats is None:
-            return []
-        return list(feats() if callable(feats) else feats)
+    # Varre todos os Placemarks
+    for pm in root.findall(".//" + K + "Placemark"):
+        # ExtendedData -> SimpleData (propriedades)
+        p = {}
+        for sd in pm.findall(".//" + K + "SimpleData"):
+            name = sd.attrib.get("name")
+            if name:
+                p[name] = (sd.text or "").strip()
 
-    def walk(node):
-        children = iter_children(node)
-        if not children:
-            yield node
-        else:
-            for ch in children:
-                yield from walk(ch)
-
-    for f in walk(k):
-        geom = getattr(f, "geometry", None)
-        if geom:
-            geoms.append(shape(geom.__geo_interface__))
-            p = {}
-            ed = getattr(f, "extended_data", None)
-            if ed:
-                for el in getattr(ed, "elements", []):
-                    p[el.name] = el.value
-            props.append(p)
+        # Polígonos (apenas outerBoundary; se tiver innerBoundary, ignoramos por simplicidade)
+        for poly in pm.findall(".//" + K + "Polygon"):
+            coords_el = poly.find(".//" + K + "coordinates")
+            if coords_el is None:
+                continue
+            coords_txt = "".join(coords_el.itertext()).replace("\n", " ").strip()
+            if not coords_txt:
+                continue
+            pts = []
+            for token in coords_txt.split():
+                parts = token.split(",")
+                if len(parts) >= 2:
+                    try:
+                        lon = float(parts[0]); lat = float(parts[1])
+                        pts.append((lon, lat))
+                    except ValueError:
+                        continue
+            if len(pts) >= 3:
+                try:
+                    geoms.append(Polygon(pts))
+                    props.append(dict(p))  # copia rótulos
+                except Exception:
+                    continue
 
     if not geoms:
-        raise RuntimeError("KML sem geometrias (fastkml).")
+        raise RuntimeError("KML sem geometrias (parser XML).")
 
     return gpd.GeoDataFrame(props, geometry=geoms, crs="EPSG:4326")
+
 
 def _extent_with_padding(geom, pad_ratio=0.10):
     minx, miny, maxx, maxy = geom.bounds
