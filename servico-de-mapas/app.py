@@ -1,13 +1,13 @@
 # app.py
-import os, io, json, base64, math, logging, random, requests
+import os, io, json, base64, math, logging, random
 import geopandas as gpd
 import matplotlib
 matplotlib.use('Agg')
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
-import matplotlib.pyplot as plt
 from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 from matplotlib import patheffects as pe
+import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.io.img_tiles as cimgt
 from shapely.geometry import GeometryCollection, box
@@ -15,9 +15,8 @@ from shapely.ops import unary_union
 from PIL import Image
 from flask import Flask, request, send_file, jsonify
 
-# ------------------ Config ------------------
+# --- Config ---
 DEFAULT_PROVIDER = os.getenv("TILE_PROVIDER", "google_hybrid")  # google_hybrid | mapbox_hybrid | osm
-# Templates do Google Hybrid (XYZ). Requer licença/termos Google.
 GOOGLE_TEMPLATES = [
     "https://mt0.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
     "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
@@ -36,33 +35,40 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH_MB * 1024 * 1024
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("generate-map")
-_LOGO_IMG = None
 
-# ------------------ Tiles ------------------
-class XYZTiles(cimgt.ImageTiles):
-    def __init__(self, url_template: str, cache=True, user_agent=None):
-        self.url_template = url_template
-        super().__init__(cache=cache, user_agent=user_agent)
-    def _image_url(self, tile):
-        x, y, z = tile
-        return self.url_template.format(x=x, y=y, z=z)
+# --- Dependências opcionais (para logo) ---
+try:
+    import requests
+except Exception:
+    requests = None
 
+# --- Compat: ImageTiles pode não existir em algumas versões do Cartopy ---
+HAS_IMGTILES = hasattr(cimgt, "ImageTiles")
+
+if HAS_IMGTILES:
+    class XYZTiles(cimgt.ImageTiles):
+        def __init__(self, url_template: str, cache=True, user_agent=None):
+            self.url_template = url_template
+            super().__init__(cache=cache, user_agent=user_agent)
+        def _image_url(self, tile):
+            x, y, z = tile
+            return self.url_template.format(x=x, y=y, z=z)
+else:
+    XYZTiles = None  # sem suporte a XYZ genérico nesta versão do cartopy
+
+# --- Funções auxiliares ---
 def _make_tile_source(provider: str):
-    # 1) Google Hybrid (hardcoded)
-    if provider == "google_hybrid":
+    # Preferir Google/Mapbox se houver suporte a XYZ genérico
+    if provider == "google_hybrid" and XYZTiles is not None:
         template = random.choice(GOOGLE_TEMPLATES)
         return XYZTiles(template, cache=True, user_agent=USER_AGENT), "Google Hybrid"
-    # 2) Mapbox Hybrid
-    if provider in ("google_hybrid", "mapbox_hybrid") and MAPBOX_TOKEN:
-        mb_url = (
-            "https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/tiles/256/"
-            "{z}/{x}/{y}@2x?access_token=" + MAPBOX_TOKEN
-        )
+    if provider in ("google_hybrid", "mapbox_hybrid") and XYZTiles is not None and MAPBOX_TOKEN:
+        mb_url = ("https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/tiles/256/"
+                  "{z}/{x}/{y}@2x?access_token=" + MAPBOX_TOKEN)
         return XYZTiles(mb_url, cache=True, user_agent=USER_AGENT), "Mapbox Satellite-Streets"
-    # 3) OSM (fallback)
+    # Fallback universal (sempre existe)
     return cimgt.OSM(cache=True, user_agent=USER_AGENT), "OpenStreetMap"
 
-# ------------------ Payload ------------------
 def _extract_kml_bytes(payload):
     if payload is None:
         raise ValueError("JSON ausente ou malformado (Content-Type deve ser application/json).")
@@ -89,12 +95,8 @@ def _read_kml_gdf(kml_bytes):
         return gpd.read_file(bio, driver="LIBKML")
     except Exception:
         bio.seek(0)
-        try:
-            return gpd.read_file(bio, driver="KML")
-        except Exception as e:
-            raise RuntimeError("Falha lendo KML (drivers LIBKML/KML indisponíveis). Detalhes: " + str(e))
+        return gpd.read_file(bio, driver="KML")
 
-# ------------------ Geometria / layout ------------------
 def _extent_with_padding(geom, pad_ratio=0.10):
     minx, miny, maxx, maxy = geom.bounds
     dx = (maxx - minx) or 1e-6
@@ -129,14 +131,21 @@ def _principal_orientation(geom):
     except Exception:
         return 0.0
 
+_LOGO_IMG = None
 def _load_logo(logo_url: str):
-    global _LOGO_IMG
+    global _LOGO_IMG, requests
     if _LOGO_IMG is not None:
         return _LOGO_IMG
     try:
-        r = requests.get(logo_url, timeout=10)
-        r.raise_for_status()
-        img = Image.open(io.BytesIO(r.content)).convert("RGBA")
+        if requests is None:
+            import urllib.request
+            with urllib.request.urlopen(logo_url, timeout=10) as resp:
+                data = resp.read()
+        else:
+            r = requests.get(logo_url, timeout=10)
+            r.raise_for_status()
+            data = r.content
+        img = Image.open(io.BytesIO(data)).convert("RGBA")
         _LOGO_IMG = img
         return img
     except Exception as e:
@@ -152,7 +161,7 @@ def _add_logo(ax, pil_img, width_px=220):
                         frameon=False, box_alignment=(1,1), pad=0)
     ax.add_artist(ab)
 
-# ------------------ Endpoints ------------------
+# --- Endpoints ---
 @app.route("/generate-map", methods=["POST"])
 def generate_map():
     try:
@@ -180,7 +189,7 @@ def generate_map():
 
         fig = Figure(figsize=(10,8), dpi=150)
         canvas = FigureCanvas(fig)
-        ax = fig.add_subplot(1,1,1, projection=tile_src.crs if hasattr(tile_src,"crs") else ccrs.PlateCarree())
+        ax = fig.add_subplot(1,1,1, projection=getattr(tile_src, "crs", ccrs.PlateCarree()))
 
         extent = _extent_with_padding(geom, pad_ratio=0.10)
         ax.set_extent(extent, crs=ccrs.PlateCarree())
@@ -189,9 +198,9 @@ def generate_map():
         try:
             ax.add_image(tile_src, zoom, interpolation="spline36")
         except Exception as e_tiles:
-            log.warning(f"Tiles falharam ({provider_name}): {e_tiles}")
+            log.warning(f"Falha ao adicionar tiles ({provider_name}): {e_tiles}")
 
-        # Máscara fora do polígono
+        # Máscara fora
         view_rect = box(extent[0], extent[2], extent[1], extent[3])
         try:
             mask_geom = view_rect.difference(geom.buffer(0))
@@ -208,16 +217,15 @@ def generate_map():
         for c in ax.collections[-1:]:
             c.set_path_effects([pe.Stroke(linewidth=3.8, foreground='black'), pe.Normal()])
 
-        # Pino
+        # Pino + rótulo
         try:
             pt = geom.representative_point()
-            ax.scatter([pt.x], [pt.y], transform=ccrs.PlateCarree(),
-                       s=70, zorder=8, marker='o',
-                       facecolor=BRAND_COLOR, edgecolor='white', linewidth=1.5)
+            ax.scatter([pt.x],[pt.y], transform=ccrs.PlateCarree(),
+                       s=70, zorder=8, marker='o', facecolor=BRAND_COLOR,
+                       edgecolor='white', linewidth=1.5)
         except Exception:
             pt = None
 
-        # Rótulo alinhado
         angle = _principal_orientation(geom)
         cx, cy = geom.centroid.x, geom.centroid.y
         txt = ax.text(cx, cy, label_text, transform=ccrs.PlateCarree(),
@@ -226,14 +234,12 @@ def generate_map():
 
         # Coordenadas
         if show_coords:
-            if pt is not None:
-                lat, lon = pt.y, pt.x
-            else:
-                lat, lon = geom.centroid.y, geom.centroid.x
+            if pt is not None: lat, lon = pt.y, pt.x
+            else:              lat, lon = geom.centroid.y, geom.centroid.x
             fig.text(0.02, 0.06, f"{lat:.5f}, {lon:.5f}", fontsize=8, color='white',
                      path_effects=[pe.withStroke(linewidth=2.5, foreground='black')])
 
-        # Atribuição e logo
+        # Atribuição + logo
         ax.set_axis_off()
         fig.text(0.01, 0.01, f"© {provider_name}", fontsize=6, color='white',
                  path_effects=[pe.withStroke(linewidth=2.0, foreground='black')])
@@ -244,9 +250,7 @@ def generate_map():
         fig.savefig(buf, format="jpeg", dpi=150, bbox_inches="tight", pad_inches=0,
                     quality=max(60, min(95, jpg_quality)), optimize=True, progressive=True)
         buf.seek(0)
-
-        download_name = (cod or "mapa") + ".jpg"
-        return send_file(buf, mimetype="image/jpeg", download_name=download_name)
+        return send_file(buf, mimetype="image/jpeg", download_name=(cod or "mapa") + ".jpg")
 
     except ValueError as ve:
         return jsonify({"error": str(ve)}), 400
@@ -254,7 +258,7 @@ def generate_map():
         log.exception("Erro inesperado")
         return jsonify({"error": str(e)}), 500
 
-@app.route("/health", methods=["GET"])
+@app.get("/health")
 def health():
     return {"ok": True}, 200
 
