@@ -39,8 +39,8 @@ GOOGLE_TEMPLATES = [
 MAPBOX_TOKEN_ENV = os.getenv("MAPBOX_TOKEN", "")
 USER_AGENT       = os.getenv("TILE_USER_AGENT", "SmartFazendas/1.0 (contato@smartfazendas.com.br)")
 DEFAULT_LOGO_URL = os.getenv("LOGO_URL", "https://raw.githubusercontent.com/rodrigocoladello/logomarca/main/Logo%20Smart%20Fazendas%20Roxo.png")
-DEFAULT_DARKEN_ALPHA = float(os.getenv("DARKEN_ALPHA", "0.55"))  # máscara fora do polígono (escurecer só o fundo)
-DEFAULT_POLY_ALPHA   = float(os.getenv("POLY_ALPHA", "0.28"))    # amarelo dentro do polígono
+DEFAULT_DARKEN_ALPHA = float(os.getenv("DARKEN_ALPHA", "0.55"))  # máscara fora do polígono
+DEFAULT_POLY_ALPHA   = float(os.getenv("POLY_ALPHA", "0.28"))    # preenchimento amarelo
 DEFAULT_JPG_QUALITY  = int(os.getenv("JPG_QUALITY", "82"))
 BRAND_COLOR = os.getenv("BRAND_COLOR", "#346DFF")
 MAX_CONTENT_LENGTH_MB = int(os.getenv("MAX_CONTENT_LENGTH_MB", "8"))
@@ -221,19 +221,19 @@ def _load_logo(url: str):
         log.warning(f"Falha logo: {e}")
         return None
 
-def _add_logo(ax, pil_img, width_px=220, zorder=50):
-    """Adiciona logo SEM ser afetada pelo darken (zorder alto)."""
+def _add_logo(ax, pil_img, width_px=220):
     if pil_img is None: return
     from matplotlib.offsetbox import OffsetImage, AnnotationBbox
     w,h = pil_img.size
     zoom = width_px/float(w)
     imagebox = OffsetImage(pil_img, zoom=zoom)
     ab = AnnotationBbox(imagebox, (0.985, 0.985), xycoords='axes fraction',
-                        frameon=False, box_alignment=(1,1), pad=0, zorder=zorder)
+                        frameon=False, box_alignment=(1,1), pad=0)
     ax.add_artist(ab)
 
+# -------- ocultar eixos/bordas de modo compatível
 def hide_axes(ax):
-    """Esconde contornos/bordas do eixo (compatível com várias versões)."""
+    """Esconde contornos/bordas do eixo de forma compatível com várias versões."""
     try:
         ax.set_axis_off()
     except Exception:
@@ -254,26 +254,6 @@ def hide_axes(ax):
             ax.patch.set_visible(False)
     except Exception:
         pass
-
-# ---- Ajuste de aspecto para eliminar laterais brancas ----
-def _match_figure_to_extent(fig, extent84, enable=True):
-    if not enable or extent84 is None:
-        return
-    def _mx(lon):  # lon/lat -> WebMercator (m)
-        return 6378137.0 * math.radians(lon)
-    def _my(lat):
-        lat = max(-85.05112878, min(85.05112878, lat))
-        return 6378137.0 * math.log(math.tan(math.pi/4 + math.radians(lat)/2))
-    minlon, maxlon, minlat, maxlat = extent84
-    w = _mx(maxlon) - _mx(minlon)
-    h = _my(maxlat) - _my(minlat)
-    if w <= 0 or h <= 0:
-        return
-    target_aspect = w / h
-    h_in = fig.get_figheight()
-    w_in = h_in * target_aspect
-    w_in = max(6.0, min(14.0, w_in))
-    fig.set_size_inches(w_in, h_in, forward=True)
 
 # ------------------ XYZ manual (sem ImageTiles) ------------------
 def _lonlat_to_pixel(lon, lat, z, tile_size=256):
@@ -354,19 +334,18 @@ def generate_map():
     try:
         q = request.args
         provider     = q.get("provider", DEFAULT_PROVIDER).strip()
-        darken_alpha = float(q.get("darken", DEFAULT_DARKEN_ALPHA))        # máscara externa (só fundo)
+        darken_alpha = float(q.get("darken", DEFAULT_DARKEN_ALPHA))        # máscara externa
         poly_alpha   = float(q.get("poly_alpha", DEFAULT_POLY_ALPHA))      # amarelo dentro
         jpg_quality  = int(q.get("jpg_quality", DEFAULT_JPG_QUALITY))
         logo_url     = q.get("logo_url", DEFAULT_LOGO_URL)
         show_coords  = q.get("coords", "1").lower() in ("1","true","yes")
         mapbox_token = q.get("mapbox_token", MAPBOX_TOKEN_ENV)
-        fit_aspect   = q.get("fit_aspect", "1").lower() in ("1","true","yes")
 
         # Pino por coordenadas
         pin_lat = q.get("pin_lat"); pin_lon = q.get("pin_lon")
         pin_lat = float(pin_lat) if pin_lat is not None else None
         pin_lon = float(pin_lon) if pin_lon is not None else None
-        pin_text = q.get("pin_text")
+        pin_text = q.get("pin_text")       # se None, usa "lat, lon"
         pin_color = q.get("pin_color", BRAND_COLOR)
         pin_zoom = q.get("pin_zoom"); pin_zoom = int(pin_zoom) if pin_zoom else None
 
@@ -384,7 +363,7 @@ def generate_map():
         cod = _extract_cod_imovel(gdf)
         label_text = f"CAR: {cod}" if cod else "CAR"
 
-        # ===== Figura =====
+        # ===== Figura (sem bordas) =====
         fig = Figure(figsize=(10, 8), dpi=150); fig.set_facecolor("white")
         canvas = FigureCanvas(fig)
 
@@ -403,9 +382,6 @@ def generate_map():
         else:
             return jsonify({"error": "Forneça KML em JSON['data'] ou 'pin_lat' e 'pin_lon' na query."}), 400
 
-        # Ajuste do aspecto para eliminar laterais brancas
-        _match_figure_to_extent(fig, extent84, enable=fit_aspect)
-
         # ===== Eixo/tiles =====
         if HAS_IMGTILES:
             tile_src, provider_name = _make_tile_source(provider, mapbox_token)
@@ -413,7 +389,7 @@ def generate_map():
                               projection=getattr(tile_src, "crs", ccrs.epsg(3857)))
             ax.set_extent(extent84, crs=ccrs.PlateCarree())
             try:
-                ax.add_image(tile_src, zoom, interpolation="spline36")  # zorder padrão ~1
+                ax.add_image(tile_src, zoom, interpolation="spline36")
             except Exception as e_tiles:
                 log.warning(f"Falha add_image ({provider_name}): {e_tiles}. Usando XYZ manual.")
                 ax = fig.add_axes([0, 0, 1, 1], projection=ccrs.epsg(3857))
@@ -430,15 +406,14 @@ def generate_map():
 
         hide_axes(ax)
 
-        # ===== Máscara externa escura (SOMENTE acima do fundo) =====
-        # zorder=4 (acima dos tiles z~1 e abaixo de polígono/labels/logo)
-        if geom is not None and darken_alpha > 0:
+        # ===== Máscara externa escura =====
+        if geom is not None:
             try:
                 view_rect = box(extent84[0], extent84[2], extent84[1], extent84[3])
                 mask_geom = view_rect.difference(geom.buffer(0))
                 ax.add_geometries([mask_geom], crs=ccrs.PlateCarree(),
                                   facecolor=(0, 0, 0, max(0.0, min(1.0, darken_alpha))),
-                                  edgecolor='none', zorder=4)
+                                  edgecolor='none', zorder=6)
             except Exception as e_mask:
                 log.warning(f"Máscara falhou: {e_mask}")
 
@@ -478,7 +453,7 @@ def generate_map():
             cx, cy = geom.centroid.x, geom.centroid.y
             txt = ax.text(cx, cy, label_text, transform=ccrs.PlateCarree(),
                           fontsize=13, fontweight="bold", color='white',
-                          rotation=angle, ha='center', va='center', zorder=10)
+                          rotation=angle, ha='center', va='center', zorder=9)
             txt.set_path_effects([pe.withStroke(linewidth=3.2, foreground='black')])
 
         # ===== Rodapé de coordenadas =====
@@ -494,10 +469,10 @@ def generate_map():
             fig.text(0.015, 0.03, f"{lat:.5f}, {lon:.5f}", fontsize=8, color='white',
                      path_effects=[pe.withStroke(linewidth=2.6, foreground='black')])
 
-        # ===== Atribuição + logo (logo sempre ACIMA da máscara) =====
+        # ===== Atribuição + logo =====
         fig.text(0.012, 0.012, f"© {provider_name}", fontsize=6, color='white',
                  path_effects=[pe.withStroke(linewidth=2.0, foreground='black')])
-        _add_logo(ax, _load_logo(logo_url), width_px=220, zorder=50)  # zorder alto
+        _add_logo(ax, _load_logo(logo_url), width_px=220)
 
         # ===== PNG -> JPEG =====
         buf_png = io.BytesIO()
