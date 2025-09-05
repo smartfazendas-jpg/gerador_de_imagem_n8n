@@ -1,5 +1,5 @@
 # app.py
-import os, io, base64, math, logging, random, json
+import os, io, base64, math, logging, random
 import geopandas as gpd
 import matplotlib
 matplotlib.use('Agg')
@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.io.img_tiles as cimgt
 
-from shapely.geometry import GeometryCollection, box, Polygon, Point
+from shapely.geometry import GeometryCollection, box, Polygon
 from shapely.ops import unary_union
 from PIL import Image
 from flask import Flask, request, send_file, jsonify
@@ -30,20 +30,14 @@ except Exception:
 
 # ------------------ Config ------------------
 DEFAULT_PROVIDER = os.getenv("TILE_PROVIDER", "google_hybrid")
-GOOGLE_TEMPLATES = [
-    "https://mt0.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
-    "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
-    "https://mt2.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
-    "https://mt3.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
-]
-MAPBOX_TOKEN_ENV = os.getenv("MAPBOX_TOKEN", "")
 USER_AGENT       = os.getenv("TILE_USER_AGENT", "SmartFazendas/1.0 (contato@smartfazendas.com.br)")
 DEFAULT_LOGO_URL = os.getenv("LOGO_URL", "https://raw.githubusercontent.com/rodrigocoladello/logomarca/main/Logo%20Smart%20Fazendas%20Roxo.png")
-DEFAULT_DARKEN_ALPHA = float(os.getenv("DARKEN_ALPHA", "0.55"))  # máscara fora do polígono
-DEFAULT_POLY_ALPHA   = float(os.getenv("POLY_ALPHA", "0.28"))    # preenchimento amarelo
+DEFAULT_DARKEN_ALPHA = float(os.getenv("DARKEN_ALPHA", "0.55"))   # escurecer fora do polígono
+DEFAULT_POLY_ALPHA   = float(os.getenv("POLY_ALPHA", "0.28"))     # preenchimento amarelo
 DEFAULT_JPG_QUALITY  = int(os.getenv("JPG_QUALITY", "82"))
 BRAND_COLOR = os.getenv("BRAND_COLOR", "#346DFF")
 MAX_CONTENT_LENGTH_MB = int(os.getenv("MAX_CONTENT_LENGTH_MB", "8"))
+MAPBOX_TOKEN_ENV = os.getenv("MAPBOX_TOKEN", "")
 
 # Aspecto alvo 4:3 (largura:altura)
 TARGET_ASPECT = 4.0 / 3.0
@@ -66,17 +60,54 @@ if HAS_IMGTILES:
 else:
     XYZTiles = None
 
+# ---------- provedores ----------
+def _google_lyrs(provider: str) -> str:
+    # m=mapa, s=sat, y=hybrid, p=terrain
+    return {
+        "google_streets": "m",
+        "google_satellite": "s",
+        "google_hybrid": "y",
+        "google_terrain": "p",
+    }.get(provider, "y")
+
+def _mapbox_style(provider: str) -> str:
+    return {
+        "mapbox_satellite": "mapbox/satellite-v9",
+        "mapbox_satellite_streets": "mapbox/satellite-streets-v12",
+        "mapbox_streets": "mapbox/streets-v12",
+        "mapbox_outdoors": "mapbox/outdoors-v12",
+        "mapbox_light": "mapbox/light-v11",
+        "mapbox_dark": "mapbox/dark-v11",
+    }.get(provider, "mapbox/satellite-streets-v12")
+
+def _provider_template(provider: str, mapbox_token: str) -> str | None:
+    p = provider.strip().lower()
+    if p.startswith("google_"):
+        sub = random.choice(["mt0","mt1","mt2","mt3"])
+        lyrs = _google_lyrs(p)
+        return f"https://{sub}.google.com/vt/lyrs={lyrs}&x={{x}}&y={{y}}&z={{z}}"
+    if p.startswith("mapbox:"):
+        # estilo completo passado pelo usuário: mapbox:<user_or_ns>/<style-id>
+        style = p.split(":",1)[1]
+        if not mapbox_token: return None
+        return f"https://api.mapbox.com/styles/v1/{style}/tiles/256/{{z}}/{{x}}/{{y}}@2x?access_token={mapbox_token}"
+    if p.startswith("mapbox_"):
+        if not mapbox_token: return None
+        style = _mapbox_style(p)
+        return f"https://api.mapbox.com/styles/v1/{style}/tiles/256/{{z}}/{{x}}/{{y}}@2x?access_token={mapbox_token}"
+    if p in ("osm","openstreetmap"):
+        return "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png".replace("{s}", random.choice(["a","b","c"]))
+    # fallback
+    sub = random.choice(["mt0","mt1","mt2","mt3"])
+    return f"https://{sub}.google.com/vt/lyrs=y&x={{x}}&y={{y}}&z={{z}}"
+
 def _make_tile_source(provider: str, mapbox_token: str):
-    if provider == "google_hybrid" and XYZTiles is not None:
-        template = random.choice(GOOGLE_TEMPLATES)
-        return XYZTiles(template, cache=True, user_agent=USER_AGENT), "Google Hybrid"
-    if provider in ("mapbox_hybrid", "google_hybrid") and XYZTiles is not None and mapbox_token:
-        mb_url = ("https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/tiles/256/"
-                  "{z}/{x}/{y}@2x?access_token=" + mapbox_token)
-        return XYZTiles(mb_url, cache=True, user_agent=USER_AGENT), "Mapbox Satellite-Streets"
+    tpl = _provider_template(provider, mapbox_token)
+    if tpl and XYZTiles is not None:
+        return XYZTiles(tpl, cache=True, user_agent=USER_AGENT), provider
     return cimgt.OSM(cache=True, user_agent=USER_AGENT), "OpenStreetMap"
 
-# ------------------ KML ------------------
+# ------------------ KML helpers ------------------
 def _extract_kml_bytes(payload):
     if payload is None:
         return None
@@ -184,144 +215,72 @@ def _extent_from_center_zoom(lon, lat, zoom):
     lat_span = lon_span / max(0.2, math.cos(math.radians(lat)))
     return [lon - lon_span/2, lon + lon_span/2, lat - lat_span/2, lat + lat_span/2]
 
-def _extract_cod_imovel(gdf):
-    if gdf is None: return None
-    for col in gdf.columns:
-        if "cod_imovel" in col.lower():
-            s = gdf[col].dropna()
-            if not s.empty: return str(s.iloc[0]).strip()
-    return None
-
-def _principal_orientation(geom):
-    try:
-        mrr = geom.minimum_rotated_rectangle
-        coords = list(mrr.exterior.coords)
-        max_len, best = -1, None
-        for i in range(4):
-            x1,y1 = coords[i]; x2,y2 = coords[(i+1)%4]
-            L = math.hypot(x2-x1, y2-y1)
-            if L>max_len: max_len, best = L, ((x1,y1),(x2,y2))
-        (x1,y1),(x2,y2) = best
-        return math.degrees(math.atan2(y2-y1, x2-x1))
-    except Exception:
-        return 0.0
-
-# ---- Mercator helpers (para ajuste de aspecto 4:3)
+# Mercator helpers (para ajustar 4:3)
 R_MERC = 6378137.0
-def _merc_x(lon):
-    return math.radians(lon) * R_MERC
+def _merc_x(lon): return math.radians(lon) * R_MERC
 def _merc_y(lat):
     lat = max(-85.05112878, min(85.05112878, lat))
     return R_MERC * math.log(math.tan(math.pi/4 + math.radians(lat)/2))
-def _inv_merc_x(x):
-    return math.degrees(x / R_MERC)
-def _inv_merc_y(y):
-    return math.degrees(2*math.atan(math.exp(y / R_MERC)) - math.pi/2)
+def _inv_merc_x(x): return math.degrees(x / R_MERC)
+def _inv_merc_y(y): return math.degrees(2*math.atan(math.exp(y / R_MERC)) - math.pi/2)
 
 def _adjust_extent_to_aspect(ext84, target_aspect=TARGET_ASPECT):
-    """
-    Recebe extent em WGS84 [minlon, maxlon, minlat, maxlat]
-    Ajusta para que, em WebMercator (EPSG:3857), width/height == target_aspect,
-    expandindo simetricamente a menor dimensão.
-    """
     minlon, maxlon, minlat, maxlat = ext84
     xmin, xmax = _merc_x(minlon), _merc_x(maxlon)
     ymin, ymax = _merc_y(minlat), _merc_y(maxlat)
-
     width  = max(1e-9, xmax - xmin)
     height = max(1e-9, ymax - ymin)
     cur_aspect = width / height
-
     if abs(cur_aspect - target_aspect) < 1e-6:
-        return ext84  # já está ok
-
+        return ext84
     if cur_aspect > target_aspect:
-        # muito "largo": precisamos aumentar a altura
         desired_h = width / target_aspect
-        delta = (desired_h - height) / 2.0
-        ymin -= delta; ymax += delta
+        d = (desired_h - height) / 2.0
+        ymin -= d; ymax += d
     else:
-        # muito "alto": precisamos aumentar a largura
         desired_w = height * target_aspect
-        delta = (desired_w - width) / 2.0
-        xmin -= delta; xmax += delta
+        d = (desired_w - width) / 2.0
+        xmin -= d; xmax += d
+    return [_inv_merc_x(xmin), _inv_merc_x(xmax), _inv_merc_y(ymin), _inv_merc_y(ymax)]
 
-    # volta pra WGS84
-    minlon2, maxlon2 = _inv_merc_x(xmin), _inv_merc_x(xmax)
-    minlat2, maxlat2 = _inv_merc_y(ymin), _inv_merc_y(ymax)
-    return [minlon2, maxlon2, minlat2, maxlat2]
-
-_LOGO_IMG = None
-def _load_logo(url: str):
-    global _LOGO_IMG, requests
-    if _LOGO_IMG is not None: return _LOGO_IMG
-    try:
-        if requests is None:
-            import urllib.request
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(req, timeout=10) as r: data = r.read()
-        else:
-            r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
-            r.raise_for_status(); data = r.content
-        img = Image.open(io.BytesIO(data)).convert("RGBA")
-        _LOGO_IMG = img; return img
-    except Exception as e:
-        log.warning(f"Falha logo: {e}")
-        return None
-
-def _add_logo(ax, pil_img, width_px=220):
-    if pil_img is None: return
-    from matplotlib.offsetbox import OffsetImage, AnnotationBbox
-    w,h = pil_img.size
-    zoom = width_px/float(w)
-    imagebox = OffsetImage(pil_img, zoom=zoom)
-    ab = AnnotationBbox(imagebox, (0.985, 0.985), xycoords='axes fraction',
-                        frameon=False, box_alignment=(1,1), pad=0)
-    ab.set_zorder(1000)  # garante que fica acima da máscara/polígono
-    ax.add_artist(ab)
-
-# -------- ocultar eixos/bordas de modo compatível
+# -------- ocultar eixos + full-bleed
 def hide_axes(ax):
-    """Esconde contornos/bordas do eixo de forma compatível com várias versões."""
-    try:
-        ax.set_axis_off()
-    except Exception:
-        pass
+    try: ax.set_axis_off()
+    except: pass
     try:
         op = getattr(ax, "outline_patch", None)
-        if op is not None:
-            op.set_visible(False)
-    except Exception:
-        pass
+        if op is not None: op.set_visible(False)
+    except: pass
     try:
         for sp in getattr(ax, "spines", {}).values():
             sp.set_visible(False)
-    except Exception:
-        pass
+    except: pass
     try:
         if hasattr(ax, "patch") and ax.patch is not None:
             ax.patch.set_visible(False)
-    except Exception:
-        pass
+    except: pass
 
-# ------------------ XYZ manual (sem ImageTiles) ------------------
-def _lonlat_to_pixel(lon, lat, z, tile_size=256):
-    n = 2 ** z
-    x = (lon + 180.0) / 360.0 * n * tile_size
-    lat = max(-85.05112878, min(85.05112878, lat))
-    y = (1.0 - math.log(math.tan(math.radians(lat)) + (1 / math.cos(math.radians(lat)))) / math.pi) / 2.0 * n * tile_size
-    return x, y
+def force_full_bleed(ax):
+    try: ax.set_aspect('auto', adjustable='box')
+    except: pass
+    try: ax.set_position([0, 0, 1, 1])
+    except: pass
 
+# ------------------ XYZ manual (fallback) ------------------
 def _tile_url(provider, x, y, z, mapbox_token):
-    if provider == "google_hybrid":
+    p = provider.strip().lower()
+    if p.startswith("google_"):
         sub = random.choice(["mt0","mt1","mt2","mt3"])
-        return f"https://{sub}.google.com/vt/lyrs=y&x={x}&y={y}&z={z}"
-    elif provider == "mapbox_hybrid" and mapbox_token:
-        return ("https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/tiles/256/"
-                f"{z}/{x}/{y}@2x?access_token={mapbox_token}")
-    else:
-        sub = random.choice(["a","b","c"])
-        return f"https://{sub}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+        lyrs = _google_lyrs(p)
+        return f"https://{sub}.google.com/vt/lyrs={lyrs}&x={x}&y={y}&z={z}"
+    if p.startswith("mapbox:"):
+        style = p.split(":",1)[1]
+        return f"https://api.mapbox.com/styles/v1/{style}/tiles/256/{z}/{x}/{y}@2x?access_token={mapbox_token}"
+    if p.startswith("mapbox_"):
+        style = _mapbox_style(p)
+        return f"https://api.mapbox.com/styles/v1/{style}/tiles/256/{z}/{x}/{y}@2x?access_token={mapbox_token}"
+    sub = random.choice(["a","b","c"])
+    return f"https://{sub}.tile.openstreetmap.org/{z}/{x}/{y}.png"
 
 def _fetch_tile(url, timeout=8):
     hdrs = {"User-Agent": USER_AGENT}
@@ -332,6 +291,13 @@ def _fetch_tile(url, timeout=8):
             return Image.open(io.BytesIO(r.read())).convert("RGBA")
     r = requests.get(url, headers=hdrs, timeout=timeout); r.raise_for_status()
     return Image.open(io.BytesIO(r.content)).convert("RGBA")
+
+def _lonlat_to_pixel(lon, lat, z, tile_size=256):
+    n = 2 ** z
+    x = (lon + 180.0) / 360.0 * n * tile_size
+    lat = max(-85.05112878, min(85.05112878, lat))
+    y = (1.0 - math.log(math.tan(math.radians(lat)) + (1 / math.cos(math.radians(lat)))) / math.pi) / 2.0 * n * tile_size
+    return x, y
 
 def _build_xyz_mosaic(extent_wgs84, z, provider, mapbox_token, tile_size=256):
     minlon, maxlon, minlat, maxlat = extent_wgs84
@@ -367,31 +333,32 @@ def _build_xyz_mosaic(extent_wgs84, z, provider, mapbox_token, tile_size=256):
     ymin_merc, ymax_merc = _merc_y(minlat), _merc_y(maxlat)
     extent3857 = [xmin_merc, xmax_merc, ymin_merc, ymax_merc]
 
-    prov_name = {"google_hybrid":"Google Hybrid",
-                 "mapbox_hybrid":"Mapbox Satellite-Streets",
-                 "osm":"OpenStreetMap"}.get(actual_provider, actual_provider)
-    return crop, extent3857, prov_name
+    return crop, extent3857, actual_provider
 
 # ------------------ Endpoints ------------------
 @app.post("/generate-map")
 def generate_map():
     try:
         q = request.args
-        provider     = q.get("provider", DEFAULT_PROVIDER).strip()
-        darken_alpha = float(q.get("darken", DEFAULT_DARKEN_ALPHA))        # máscara externa
-        poly_alpha   = float(q.get("poly_alpha", DEFAULT_POLY_ALPHA))      # amarelo dentro
+        provider     = q.get("provider", DEFAULT_PROVIDER)
+        darken_alpha = float(q.get("darken", DEFAULT_DARKEN_ALPHA))             # fora do polígono
+        poly_alpha   = float(q.get("transparencia", q.get("poly_alpha", DEFAULT_POLY_ALPHA)))
         jpg_quality  = int(q.get("jpg_quality", DEFAULT_JPG_QUALITY))
         logo_url     = q.get("logo_url", DEFAULT_LOGO_URL)
         show_coords  = q.get("coords", "1").lower() in ("1","true","yes")
         mapbox_token = q.get("mapbox_token", MAPBOX_TOKEN_ENV)
 
-        # Pino por coordenadas
-        pin_lat = q.get("pin_lat"); pin_lon = q.get("pin_lon")
-        pin_lat = float(pin_lat) if pin_lat is not None else None
-        pin_lon = float(pin_lon) if pin_lon is not None else None
-        pin_text = q.get("pin_text")       # se None, usa "lat, lon"
+        # CAR (título opcional)
+        car_title = q.get("car")  # se None, não mostra título
+
+        # Pino: somente se vierem latitude & longitude
+        lat_raw = q.get("latitude", q.get("pin_lat"))
+        lon_raw = q.get("longitude", q.get("pin_lon"))
+        pin_lat = float(lat_raw) if lat_raw is not None else None
+        pin_lon = float(lon_raw) if lon_raw is not None else None
+        pin_text = q.get("pin_text")  # se não vier, usar exatamente o texto das queries (lat_raw, lon_raw)
         pin_color = q.get("pin_color", BRAND_COLOR)
-        pin_zoom = q.get("pin_zoom"); pin_zoom = int(pin_zoom) if pin_zoom else None
+        pin_zoom  = q.get("pin_zoom"); pin_zoom = int(pin_zoom) if pin_zoom else None
 
         payload  = request.get_json(silent=True)
         kml_byt  = _extract_kml_bytes(payload)
@@ -404,40 +371,34 @@ def generate_map():
         else:
             geom = None
 
-        cod = _extract_cod_imovel(gdf)
-        label_text = f"CAR: {cod}" if cod else "CAR"
-
         # ===== Figura 4:3 (sem bordas) =====
-        fig = Figure(figsize=(12, 9), dpi=150)  # 4:3
+        fig = Figure(figsize=(12, 9), dpi=150)   # 4:3
         fig.set_facecolor("white")
-        canvas = FigureCanvas(fig)
+        FigureCanvas(fig)
+        fig.subplots_adjust(0,0,1,1)
 
         # ===== Extent/zoom inicial =====
         if geom is not None:
             extent84 = _extent_with_padding(geom, pad_ratio=0.10)
-            # incluir pino no envelope, se houver
             if pin_lat is not None and pin_lon is not None:
                 minx, maxx, miny, maxy = extent84
                 minx = min(minx, pin_lon); maxx = max(maxx, pin_lon)
                 miny = min(miny, pin_lat); maxy = max(maxy, pin_lat)
                 extent84 = [minx, maxx, miny, maxy]
-            # ajusta para 4:3 em Mercator
             extent84 = _adjust_extent_to_aspect(extent84, TARGET_ASPECT)
-            # recomputa zoom com base no span lon após ajuste
             zoom = _zoom_from_lon_span(extent84[0], extent84[1])
         elif pin_lat is not None and pin_lon is not None:
             zoom = min(18, max(1, pin_zoom if pin_zoom is not None else 15))
             extent84 = _extent_from_center_zoom(pin_lon, pin_lat, zoom)
             extent84 = _adjust_extent_to_aspect(extent84, TARGET_ASPECT)
-            zoom = _zoom_from_lon_span(extent84[0], extent84[1])  # readequar
+            zoom = _zoom_from_lon_span(extent84[0], extent84[1])
         else:
-            return jsonify({"error": "Forneça KML em JSON['data'] ou 'pin_lat' e 'pin_lon' na query."}), 400
+            return jsonify({"error": "Forneça KML em JSON['data'] ou 'latitude' e 'longitude' na query."}), 400
 
         # ===== Eixo/tiles =====
         if HAS_IMGTILES:
             tile_src, provider_name = _make_tile_source(provider, mapbox_token)
-            ax = fig.add_axes([0, 0, 1, 1],
-                              projection=getattr(tile_src, "crs", ccrs.epsg(3857)))
+            ax = fig.add_axes([0, 0, 1, 1], projection=getattr(tile_src, "crs", ccrs.epsg(3857)))
             ax.set_extent(extent84, crs=ccrs.PlateCarree())
             try:
                 ax.add_image(tile_src, zoom, interpolation="spline36")
@@ -455,10 +416,12 @@ def generate_map():
             ax.imshow(img_bg, extent=wm_extent, transform=ccrs.epsg(3857),
                       origin="upper", interpolation="bilinear", zorder=1)
 
+        # full-bleed + esconder eixos
+        force_full_bleed(ax)
         hide_axes(ax)
 
         # ===== Máscara externa escura =====
-        if geom is not None:
+        if geom is not None and darken_alpha > 0:
             try:
                 view_rect = box(extent84[0], extent84[2], extent84[1], extent84[3])
                 mask_geom = view_rect.difference(geom.buffer(0))
@@ -468,62 +431,78 @@ def generate_map():
             except Exception as e_mask:
                 log.warning(f"Máscara falhou: {e_mask}")
 
-        # ===== Polígono (amarelo ajustável) =====
+        # ===== Polígono (amarelo com transparência da query) =====
         if geom is not None:
+            a = max(0.0, min(1.0, poly_alpha))
             ax.add_geometries([geom], crs=ccrs.PlateCarree(),
-                              facecolor=(1.0, 1.0, 0.0, max(0.0, min(1.0, poly_alpha))),
+                              facecolor=(1.0, 1.0, 0.0, a),
                               edgecolor="#FFE14A", linewidth=3.0, zorder=7)
             for c in ax.collections[-1:]:
                 c.set_path_effects([pe.Stroke(linewidth=5.0, foreground='black'), pe.Normal()])
 
-        # ===== Pino do imóvel (representative_point) =====
-        pt_obj = None
-        if geom is not None:
-            try:
-                pt_obj = geom.representative_point()
-                ax.scatter([pt_obj.x],[pt_obj.y], transform=ccrs.PlateCarree(),
-                           s=70, zorder=8, marker='o', facecolor=BRAND_COLOR,
-                           edgecolor='white', linewidth=1.6)
-            except Exception:
-                pt_obj = None
-
-        # ===== Pino por coordenadas (query) =====
-        if pin_lat is not None and pin_lon is not None:
+        # ===== Pino por coordenadas (opcional) =====
+        if (pin_lat is not None) and (pin_lon is not None):
             ax.scatter([pin_lon],[pin_lat], transform=ccrs.PlateCarree(),
-                       s=80, zorder=9, marker='o', facecolor=pin_color,
-                       edgecolor='white', linewidth=1.8)
-            txt_label = pin_text if pin_text else f"{pin_lat:.5f}, {pin_lon:.5f}"
-            ax.annotate(txt_label, xy=(pin_lon, pin_lat), xycoords=ccrs.PlateCarree()._as_mpl_transform(ax),
-                        xytext=(0, 12), textcoords='offset points', ha='center', va='bottom',
-                        fontsize=10, color='white',
-                        path_effects=[pe.withStroke(linewidth=3.0, foreground='black')], zorder=10)
+                       s=110, zorder=9, marker='o', facecolor=pin_color,
+                       edgecolor='white', linewidth=2.0)
+            label_txt = pin_text if pin_text else (f"{lat_raw}, {lon_raw}")
+            ax.annotate(label_txt, xy=(pin_lon, pin_lat),
+                        xycoords=ccrs.PlateCarree()._as_mpl_transform(ax),
+                        xytext=(0, 14), textcoords='offset points', ha='center', va='bottom',
+                        fontsize=12, color='white',
+                        path_effects=[pe.withStroke(linewidth=3.2, foreground='black')], zorder=10)
 
-        # ===== Rótulo CAR =====
-        if geom is not None:
-            angle = _principal_orientation(geom)
-            cx, cy = geom.centroid.x, geom.centroid.y
-            txt = ax.text(cx, cy, label_text, transform=ccrs.PlateCarree(),
-                          fontsize=13, fontweight="bold", color='white',
-                          rotation=angle, ha='center', va='center', zorder=9)
-            txt.set_path_effects([pe.withStroke(linewidth=3.2, foreground='black')])
+        # ===== Título CAR (se car= for informado) =====
+        if car_title:
+            # reservo espaço da logo (que fica no canto superior direito)
+            fig.text(0.82, 0.965, str(car_title),
+                     ha="right", va="top", fontsize=18, fontweight="bold",
+                     color="white",
+                     path_effects=[pe.withStroke(linewidth=4.0, foreground='black')])
 
-        # ===== Rodapé de coordenadas =====
+        # ===== Rodapé de coordenadas (opcional) =====
         if show_coords:
-            if pin_lat is not None and pin_lon is not None:
+            # Se houver pino, prioriza ele; senão, usa centróide do polígono
+            if (pin_lat is not None) and (pin_lon is not None):
                 lat, lon = pin_lat, pin_lon
-            elif pt_obj is not None:
-                lat, lon = pt_obj.y, pt_obj.x
             elif geom is not None:
-                lat, lon = geom.centroid.y, geom.centroid.x
+                cen = geom.centroid
+                lat, lon = cen.y, cen.x
             else:
                 lat, lon = 0.0, 0.0
-            fig.text(0.015, 0.03, f"{lat:.5f}, {lon:.5f}", fontsize=8, color='white',
+            fig.text(0.015, 0.03, f"{lat:.5f}, {lon:.5f}", fontsize=9, color='white',
                      path_effects=[pe.withStroke(linewidth=2.6, foreground='black')])
 
-        # ===== Atribuição + logo (logo sempre por cima) =====
-        fig.text(0.012, 0.012, f"© {provider_name}", fontsize=6, color='white',
+        # ===== Atribuição + LOGO (sempre na frente) =====
+        fig.text(0.012, 0.012, f"© {provider_name}", fontsize=7, color='white',
                  path_effects=[pe.withStroke(linewidth=2.0, foreground='black')])
-        _add_logo(ax, _load_logo(logo_url), width_px=220)
+
+        # LOGO sempre por cima (sem escurecer)
+        def _add_logo(ax, url: str, width_px=220):
+            if not url: return
+            try:
+                if requests is None:
+                    import urllib.request
+                    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+                    with urllib.request.urlopen(req, timeout=10) as r: data = r.read()
+                else:
+                    r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
+                    r.raise_for_status(); data = r.content
+                pil_img = Image.open(io.BytesIO(data)).convert("RGBA")
+            except Exception as e:
+                log.warning(f"Falha logo: {e}")
+                return
+            from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+            w,h = pil_img.size
+            zoom = width_px/float(w)
+            imagebox = OffsetImage(pil_img, zoom=zoom)
+            ab = AnnotationBbox(imagebox, (0.985, 0.985), xycoords='axes fraction',
+                                frameon=False, box_alignment=(1,1), pad=0)
+            ab.set_zorder(10000)
+            ab.set_clip_on(False)
+            ax.add_artist(ab)
+
+        _add_logo(ax, logo_url, width_px=220)
 
         # ===== PNG -> JPEG =====
         buf_png = io.BytesIO()
@@ -536,7 +515,7 @@ def generate_map():
         img.save(buf_jpg, format="JPEG", quality=q, optimize=True, progressive=True)
         buf_jpg.seek(0)
 
-        name = (cod or "mapa") + ".jpg"
+        name = (car_title or "mapa") + ".jpg"
         return send_file(buf_jpg, mimetype="image/jpeg", download_name=name)
 
     except ValueError as ve:
