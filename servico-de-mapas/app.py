@@ -630,17 +630,16 @@ def generate_map():
         out_rgb.save(buf, format="JPEG", quality=jpg_q, optimize=True, progressive=True)
 
         buf.seek(0)
-        return send_file(buf, mimetype="image/jpeg", download_name="mapa_smart_fazendas.jpg")
+        f, mimetype="image/jpeg", download_name="mapa_smart_fazendas.jpg")
 
 
 @app.post("/generate-map")
 def generate_map():
     try:
         q = request.args
-        # ... (todo o seu código atual da função)
+        # ... todo o seu código atual da função ...
         buf.seek(0)
         return send_file(buf, mimetype="image/jpeg", download_name="mapa_smart_fazendas.jpg")
-
     except Exception as e:
         log.exception("generate_map failed")
         return jsonify({
