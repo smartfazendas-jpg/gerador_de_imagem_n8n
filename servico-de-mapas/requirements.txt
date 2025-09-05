@@ -1,6 +1,5 @@
 Flask
-geopandas
-cartopy
-matplotlib
 Pillow
 numpy
+requests
+gunicorn
