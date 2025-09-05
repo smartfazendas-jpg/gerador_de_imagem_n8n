@@ -384,7 +384,26 @@ def generate_map():
                       origin="upper", interpolation="bilinear", zorder=1)
 
         ax.set_axis_off()
-        if ax.outline_patch is not None: ax.outline_patch.set_visible(False)
+# Esconde contornos de forma compatível com várias versões
+try:
+    op = getattr(ax, "outline_patch", None)
+    if op is not None:
+        op.set_visible(False)
+except Exception:
+    pass
+
+# Em algumas versões, os "spines" é que aparecem
+for sp in getattr(ax, "spines", {}).values():
+    try:
+        sp.set_visible(False)
+    except Exception:
+        pass
+
+# Eixo/painel de fundo (apenas por garantia)
+try:
+    ax.patch.set_visible(False)
+except Exception:
+    pass
 
         # ===== Máscara externa escura =====
         if geom is not None:
