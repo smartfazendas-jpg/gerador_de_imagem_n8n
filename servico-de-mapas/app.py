@@ -633,6 +633,22 @@ def generate_map():
         return send_file(buf, mimetype="image/jpeg", download_name="mapa_smart_fazendas.jpg")
 
 
+@app.post("/generate-map")
+def generate_map():
+    try:
+        q = request.args
+        # ... (todo o seu código atual da função)
+        buf.seek(0)
+        return send_file(buf, mimetype="image/jpeg", download_name="mapa_smart_fazendas.jpg")
+
+    except Exception as e:
+        log.exception("generate_map failed")
+        return jsonify({
+            "error": "Falha interna ao gerar mapa.",
+            "detail": str(e)
+        }), 500
+
+
 @app.get("/health")
 def health():
     return {
