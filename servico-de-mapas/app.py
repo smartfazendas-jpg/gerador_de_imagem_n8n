@@ -2,6 +2,8 @@
 import io, os, math, logging
 from datetime import datetime
 
+import xml.etree.ElementTree as ET
+
 import requests
 from PIL import Image
 
@@ -156,80 +158,172 @@ def estimate_zoom(extent84, base_width_px=1600):
 # -------------------------
 def gdf_from_kml_string(kml_str: str) -> gpd.GeoDataFrame:
     """
-    Lê KML e devolve GeoDataFrame em EPSG:4326.
-    1) Tenta GDAL/Fiona (driver KML); 2) fallback robusto com fastkml,
-       lidando com .features como método OU como lista.
+    Lê KML e devolve GeoDataFrame (EPSG:4326).
+    Ordem de tentativa:
+      1) GDAL/Fiona (driver KML)
+      2) fastkml (robusto, trata .features método ou lista)
+      3) XML manual (ElementTree) — busca Polygons e LinearRings diretamente
     """
-    # 1) GDAL/Fiona (quando o driver KML estiver presente)
+    # 1) GDAL/Fiona (quando disponível)
     try:
         gdf = gpd.read_file(io.BytesIO(kml_str.encode("utf-8")), driver="KML")
         if not gdf.empty:
             return gdf.to_crs(4326)
     except Exception as e:
         msg = str(e).lower()
-        # Continua para fastkml; logamos apenas para depuração
         if "unsupported driver" not in msg and "kml" not in msg:
             LOGGER.info(f"read_file(driver='KML') falhou: {e}")
 
     # 2) Fallback fastkml
-    if not HAS_FASTKML:
-        raise RuntimeError("unsupported driver: 'KML' (e fastkml não está instalado)")
+    if HAS_FASTKML:
+        try:
+            from shapely.geometry import Polygon, MultiPolygon
+            k = fastkml.KML()
+            k.from_string(kml_str.encode("utf-8"))
 
-    k = fastkml.KML()
-    k.from_string(kml_str.encode("utf-8"))
+            def iter_children(obj):
+                feats = getattr(obj, "features", None)
+                if callable(feats):
+                    try:
+                        for f in feats():
+                            yield f
+                    except TypeError:
+                        pass
+                if isinstance(feats, (list, tuple)):
+                    for f in feats:
+                        yield f
+                feats2 = getattr(obj, "_features", None)
+                if isinstance(feats2, (list, tuple)):
+                    for f in feats2:
+                        yield f
 
-    def iter_children(obj):
-        """
-        Retorna filhos de 'obj' em fastkml, suportando:
-        - obj.features()  -> gerador
-        - obj.features    -> lista/tupla
-        - obj._features   -> lista/tupla (algumas versões/objetos)
-        """
-        feats = getattr(obj, "features", None)
-        if callable(feats):
-            try:
-                for f in feats():
-                    yield f
-            except TypeError:
-                # Em casos muito raros, .features() pode ter assinatura diferente;
-                # ignoramos e avançamos para _features/lista
-                pass
-        if isinstance(feats, (list, tuple)):
-            for f in feats:
-                yield f
-        feats2 = getattr(obj, "_features", None)
-        if isinstance(feats2, (list, tuple)):
-            for f in feats2:
-                yield f
+            geoms = []
+            stack = list(iter_children(k))
+            while stack:
+                f = stack.pop()
+                geom = getattr(f, "geometry", None)
+                if geom is not None:
+                    geoms.append(geom)
+                for ch in iter_children(f):
+                    stack.append(ch)
 
-    # Percorre a árvore inteira do KML (sem NENHUM uso de .features() direto)
-    geoms = []
-    stack = list(iter_children(k))  # <- nada de k.features()
-    while stack:
-        f = stack.pop()
-        geom = getattr(f, "geometry", None)
-        if geom is not None:
-            geoms.append(geom)
-        # empilha filhos
-        for ch in iter_children(f):
-            stack.append(ch)
+            polys = []
+            for g in geoms:
+                if isinstance(g, (Polygon, MultiPolygon)):
+                    polys.append(g)
+                else:
+                    geoms_attr = getattr(g, "geoms", None)
+                    if geoms_attr:
+                        for sg in geoms_attr:
+                            if isinstance(sg, (Polygon, MultiPolygon)):
+                                polys.append(sg)
 
-    # Filtra apenas polígonos/multipolígonos; se vier coleção, tenta decompor
-    polys = []
-    for g in geoms:
-        if isinstance(g, (Polygon, MultiPolygon)):
-            polys.append(g)
-        else:
-            geoms_attr = getattr(g, "geoms", None)
-            if geoms_attr:
-                for sg in geoms_attr:
-                    if isinstance(sg, (Polygon, MultiPolygon)):
-                        polys.append(sg)
+            if polys:
+                return gpd.GeoDataFrame(geometry=polys, crs="EPSG:4326")
+        except Exception as e:
+            LOGGER.info(f"fastkml fallback falhou: {e}")
 
-    if not polys:
-        raise RuntimeError("KML sem geometrias poligonais (fastkml).")
+    # 3) Fallback final: XML manual (ElementTree)
+    #    - Suporta namespaces distintos, MultiGeometry, furos (innerBoundaryIs).
+    try:
+        ns = {
+            "kml": "http://www.opengis.net/kml/2.2",
+            "gx":  "http://www.google.com/kml/ext/2.2",
+        }
+        root = ET.fromstring(kml_str.encode("utf-8"))
 
-    return gpd.GeoDataFrame(geometry=polys, crs="EPSG:4326")
+        # helper p/ ler string "lon,lat[,alt] lon,lat[,alt] ..."
+        def parse_coords(txt):
+            coords = []
+            for token in (txt or "").replace("\n", " ").replace("\t", " ").split():
+                parts = token.split(",")
+                if len(parts) >= 2:
+                    try:
+                        lon = float(parts[0]); lat = float(parts[1])
+                        coords.append((lon, lat))
+                    except ValueError:
+                        continue
+            return coords
+
+        from shapely.geometry import Polygon, MultiPolygon, LinearRing
+        polys = []
+
+        # pega todos os Polygon em qualquer profundidade
+        # cobre casos com/sem prefixo de namespace usando buscas alternativas
+        polygon_tags = [
+            ".//{http://www.opengis.net/kml/2.2}Polygon",
+            ".//kml:Polygon",
+        ]
+        inner_tags = [
+            "{http://www.opengis.net/kml/2.2}innerBoundaryIs",
+            "kml:innerBoundaryIs",
+        ]
+        outer_tag1 = "{http://www.opengis.net/kml/2.2}outerBoundaryIs"
+        outer_tag2 = "kml:outerBoundaryIs"
+        ring_tags = [
+            "{http://www.opengis.net/kml/2.2}LinearRing",
+            "kml:LinearRing",
+        ]
+        coords_tags = [
+            "{http://www.opengis.net/kml/2.2}coordinates",
+            "kml:coordinates",
+        ]
+
+        # busca Polygons
+        found_polys = []
+        for tag in polygon_tags:
+            found_polys.extend(root.findall(tag, ns))
+
+        for poly in found_polys:
+            # OUTER
+            outer_coords = None
+            outer = poly.find(outer_tag1, ns) or poly.find(outer_tag2, ns)
+            if outer is not None:
+                ring = None
+                for rt in ring_tags:
+                    ring = outer.find(rt, ns) or ring
+                if ring is not None:
+                    coord_el = None
+                    for ct in coords_tags:
+                        coord_el = ring.find(ct, ns) or coord_el
+                    if coord_el is not None and coord_el.text:
+                        oc = parse_coords(coord_el.text)
+                        if len(oc) >= 3:
+                            outer_coords = oc
+
+            # INNERS
+            holes = []
+            for itag in inner_tags:
+                for ib in poly.findall(itag, ns):
+                    ring = None
+                    for rt in ring_tags:
+                        ring = ib.find(rt, ns) or ring
+                    if ring is not None:
+                        coord_el = None
+                        for ct in coords_tags:
+                            coord_el = ring.find(ct, ns) or coord_el
+                        if coord_el is not None and coord_el.text:
+                            ic = parse_coords(coord_el.text)
+                            if len(ic) >= 3:
+                                holes.append(ic)
+
+            if outer_coords:
+                try:
+                    p = Polygon(outer_coords, holes)
+                    if p.is_valid and not p.is_empty and p.area > 0:
+                        polys.append(p)
+                except Exception:
+                    # ignora polígonos problemáticos
+                    pass
+
+        if not polys:
+            raise RuntimeError("KML sem geometrias poligonais (XML).")
+
+        return gpd.GeoDataFrame(geometry=polys, crs="EPSG:4326")
+
+    except Exception as e:
+        raise RuntimeError(f"KML sem geometrias poligonais (fastkml).") from e
+
 
 
 
