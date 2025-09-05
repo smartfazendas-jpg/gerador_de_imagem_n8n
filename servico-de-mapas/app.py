@@ -341,10 +341,26 @@ def generate_map():
                  path_effects=[pe.withStroke(linewidth=2.0, foreground='black')])
         _add_logo(ax, _load_logo(logo_url), width_px=220)
 
+                # --- Render e saída JPEG (compatível com qualquer versão do Matplotlib) ---
         fig.tight_layout(pad=0)
-        buf = io.BytesIO()
-        fig.savefig(buf, format="jpeg", dpi=150, bbox_inches="tight", pad_inches=0,
-                    quality=max(60, min(95, jpg_quality)), optimize=True, progressive=True)
+
+        # 1) Renderiza em PNG no buffer
+        buf_png = io.BytesIO()
+        fig.savefig(buf_png, format="png", dpi=150, bbox_inches="tight", pad_inches=0)
+        plt.close(fig)  # libera memória do figure
+        buf_png.seek(0)
+
+        # 2) Converte PNG -> JPEG com Pillow controlando a qualidade
+        img = Image.open(buf_png).convert("RGB")
+        buf_jpg = io.BytesIO()
+        q = max(60, min(95, jpg_quality))  # bound seguro
+        img.save(buf_jpg, format="JPEG", quality=q, optimize=True, progressive=True)
+        buf_jpg.seek(0)
+
+        return send_file(buf_jpg,
+                         mimetype="image/jpeg",
+                         download_name=(cod or "mapa") + ".jpg")
+
         buf.seek(0)
         return send_file(buf, mimetype="image/jpeg", download_name=(cod or "mapa") + ".jpg")
 
