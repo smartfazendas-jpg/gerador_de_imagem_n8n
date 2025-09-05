@@ -1,14 +1,19 @@
-# Imagem com conda-forge pré-configurada (resolve GDAL/GEOS/PROJ)
+# Dockerfile
 FROM mambaorg/micromamba:1.5.8-jammy
 
+# utilitários mínimos + tini
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 USER $MAMBA_USER
 
-# Cria env com todas as libs nativas prontas
+# Ambiente conda-forge com TODAS as deps, incluindo GUNICORN
 RUN micromamba create -y -n app -c conda-forge \
-    python=3.11 flask requests geopandas cartopy matplotlib pillow gdal fiona shapely pyproj \
+    python=3.11 \
+    flask \
+    gunicorn \
+    requests \
+    geopandas cartopy matplotlib pillow gdal fiona shapely pyproj \
  && micromamba clean -a -y
 SHELL ["bash", "-lc"]
 ENV PATH=/opt/conda/envs/app/bin:$PATH
@@ -16,9 +21,9 @@ ENV PATH=/opt/conda/envs/app/bin:$PATH
 WORKDIR /app
 COPY . /app
 
-# Porta do serviço
 ENV PORT=5000
 EXPOSE 5000
 
-# Produção: gunicorn (mais estável que flask run)
-CMD ["bash", "-lc", "tini -g -- gunicorn app:app -w 2 -k gthread -b 0.0.0.0:${PORT} --timeout 120"]
+# tini como init, e gunicorn como servidor WSGI
+ENTRYPOINT ["/usr/bin/tini","-g","--"]
+CMD ["gunicorn","app:app","-w","2","-k","gthread","-b","0.0.0.0:5000","--timeout","120"]
