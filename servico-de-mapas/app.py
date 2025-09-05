@@ -159,7 +159,7 @@ def gdf_from_kml_string(kml_str: str) -> gpd.GeoDataFrame:
     Tenta ler via GDAL/Fiona (driver KML). Se o driver não existir, usa fastkml.
     Retorna GeoDataFrame em EPSG:4326.
     """
-    # 1) tentativa com GDAL/Fiona (se o driver existir)
+    # 1) tentativa com GDAL/Fiona (driver KML)
     try:
         gdf = gpd.read_file(io.BytesIO(kml_str.encode("utf-8")), driver="KML")
         if not gdf.empty:
@@ -167,7 +167,6 @@ def gdf_from_kml_string(kml_str: str) -> gpd.GeoDataFrame:
     except Exception as e:
         msg = str(e).lower()
         if "unsupported driver" not in msg and "kml" not in msg:
-            # outro erro qualquer; ainda vamos tentar fastkml
             LOGGER.info(f"read_file(driver='KML') falhou: {e}")
 
     # 2) fallback com fastkml
@@ -178,9 +177,16 @@ def gdf_from_kml_string(kml_str: str) -> gpd.GeoDataFrame:
     k.from_string(kml_str.encode("utf-8"))
 
     def _iter_geoms(feat):
-        # Caminha pela árvore de features do KML e retorna geometrias shapely
-        if hasattr(feat, "features"):
-            for f in feat.features():
+        """
+        Em fastkml, alguns objetos têm .features() (método) e outros têm
+        .features (lista). Precisamos lidar com ambos.
+        """
+        features_attr = getattr(feat, "features", None)
+        if callable(features_attr):
+            for f in features_attr():
+                yield from _iter_geoms(f)
+        elif isinstance(features_attr, (list, tuple)):
+            for f in features_attr:
                 yield from _iter_geoms(f)
         else:
             geom = getattr(feat, "geometry", None)
@@ -191,18 +197,12 @@ def gdf_from_kml_string(kml_str: str) -> gpd.GeoDataFrame:
     for feat in k.features():
         geoms.extend(list(_iter_geoms(feat)))
 
-    # filtra polígonos/multipolígonos (o que nos interessa para o croqui)
-    polys = []
-    for g in geoms:
-        if isinstance(g, (Polygon, MultiPolygon)):
-            polys.append(g)
-        # Se vier MultiGeometry, fastkml já converte para shapely adequado.
-
+    polys = [g for g in geoms if isinstance(g, (Polygon, MultiPolygon))]
     if not polys:
         raise RuntimeError("KML sem geometrias poligonais (fastkml).")
 
-    gdf = gpd.GeoDataFrame(geometry=polys, crs="EPSG:4326")
-    return gdf
+    return gpd.GeoDataFrame(geometry=polys, crs="EPSG:4326")
+
 
 # --------------------
 # Render helpers (plot)
