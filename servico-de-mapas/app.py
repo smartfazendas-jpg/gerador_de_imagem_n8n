@@ -107,7 +107,7 @@ def _read_kml_gdf(kml_bytes):
     if fastkml_mod is None:
         raise RuntimeError(
             "Drivers GDAL KML/LIBKML indisponíveis e 'fastkml' não instalado. "
-            "Inclua 'fastkml' na imagem (vide Dockerfile abaixo)."
+            "Inclua 'fastkml' na imagem."
         )
 
     k = fastkml_mod.KML()
@@ -116,12 +116,20 @@ def _read_kml_gdf(kml_bytes):
     from shapely.geometry import shape
     geoms, props = [], []
 
-    def walk(feat):
-        if hasattr(feat, "features"):
-            for f in feat.features():
-                yield from walk(f)
+    def iter_children(node):
+        """Suporta fastkml onde `features` pode ser método OU lista."""
+        feats = getattr(node, "features", None)
+        if feats is None:
+            return []
+        return list(feats() if callable(feats) else feats)
+
+    def walk(node):
+        children = iter_children(node)
+        if not children:
+            yield node
         else:
-            yield feat
+            for ch in children:
+                yield from walk(ch)
 
     for f in walk(k):
         geom = getattr(f, "geometry", None)
