@@ -1,4 +1,5 @@
 # app.py
+from PIL import ImageChops
 import os, io, base64, json, math, zipfile, logging
 from flask import Flask, request, send_file, jsonify
 from PIL import Image, ImageDraw, ImageFont
@@ -22,7 +23,6 @@ DEFAULT_SCALE = int(os.getenv("SCALE", "1"))      # 1 ou 2 (@2x)
 DEFAULT_DARK  = float(os.getenv("DARKEN", "0.55"))
 DEFAULT_POLY_A= float(os.getenv("POLY_ALPHA", "0.28"))
 DEFAULT_PAD   = float(os.getenv("FIT_PADDING", "0.10"))  # 0..0.4
-DEFAULT_SIMP  = float(os.getenv("SIMPLIFY_DEG", "0.0025"))
 DEFAULT_JPG_Q = int(os.getenv("JPG_QUALITY", "85"))
 UA            = os.getenv("TILE_USER_AGENT", "SmartFazendas/1.0")
 
@@ -42,20 +42,28 @@ def _inv_m_y(y): return math.degrees(2*math.atan(math.exp(y/R_MERC)) - math.pi/2
 
 def _lon2x(lon): return (lon + 180.0) / 360.0
 def _lat2y(lat):
+    lat = max(-85.05112878, min(85.05112878, lat))  # << clamp importante
     r = math.radians(lat)
     return (1.0 - math.log(math.tan(r) + 1.0/math.cos(r)) / math.pi) / 2.0
+    
+# <<< ADICIONE ESTAS DUAS LINHAS >>>
+lon2x = _lon2x
+lat2y = _lat2y
+# <<< FIM >>>
 
 def meters_per_pixel(lat_deg, z, tile_size=TILE_SIZE):
     return (math.cos(math.radians(lat_deg)) * 2*math.pi*R_MERC) / (tile_size * (2**z))
 
-def compute_zoom_for_bbox(ext84, out_w, out_h, padding=0.10, tile_size=TILE_SIZE):
-    minlon,maxlon,minlat,maxlat = ext84
-    x1,x2 = _lon2x(minlon), _lon2x(maxlon)
-    y1,y2 = _lat2y(maxlat), _lat2y(minlat)  # y cresce p/ sul
-    dx = max(1e-9, abs(x2-x1)); dy = max(1e-9, abs(y2-y1))
-    innerW = out_w * (1 - 2*padding); innerH = out_h * (1 - 2*padding)
-    scaleX = innerW / (tile_size * dx)
-    scaleY = innerH / (tile_size * dy)
+def compute_zoom_for_bbox(bbox, W, H, padding=0.10, tile=512):
+    minLon, minLat, maxLon, maxLat = bbox
+    x1, x2 = lon2x(minLon), lon2x(maxLon)
+    y1, y2 = lat2y(maxLat), lat2y(minLat)  # y cresce para sul
+    dx = max(1e-9, abs(x2 - x1))
+    dy = max(1e-9, abs(y2 - y1))
+    innerW = max(1.0, W * (1.0 - 2.0 * padding))
+    innerH = max(1.0, H * (1.0 - 2.0 * padding))
+    scaleX = innerW / (tile * dx)
+    scaleY = innerH / (tile * dy)
     z = math.floor(math.log2(max(1e-9, min(scaleX, scaleY))))
     return int(max(3, min(20, z)))
 
@@ -119,7 +127,8 @@ def simplify_ring_for_url(
     ring_lonlat = _close_ring(ring_lonlat)
     # centro/zoom
     cx = (ext84[0]+ext84[1])/2.0; cy = (ext84[2]+ext84[3])/2.0
-    z  = compute_zoom_for_bbox(ext84, out_w, out_h, padding=padding, tile_size=TILE_SIZE)
+    bbox = [ext84[0], ext84[2], ext84[1], ext84[3]]  # [minLon,minLat,maxLon,maxLat]
+    z = compute_zoom_for_bbox(bbox, out_w, out_h, padding=padding, tile=TILE_SIZE)
     mpp = meters_per_pixel(cy, z, tile_size=TILE_SIZE)
 
     ring_xy = [(_m_x(lon), _m_y(lat)) for lon,lat in ring_lonlat]
@@ -166,7 +175,6 @@ def simplify_ring_for_url(
         best = (fc, {"z":z,"mpp":mpp,"px_tol":px_tol_min,"encoded_len":_encoded_len_geojson(fc),"ring":ring_lonlat})
     return best  # (fc, meta)
 
-from PIL import ImageDraw, ImageFont
 
 def _world_px(lon, lat, z, tile_size=TILE_SIZE):
     # pixel global no mundo (tile_size=512)
@@ -200,12 +208,11 @@ def draw_overlay_locally(base_img, ring_lonlat, cx, cy, z, W, H, scale,
         dr = ImageDraw.Draw(hole)
         pts = _lonlat_ring_to_image_px(ring_lonlat, cx, cy, z, W, H, scale)
         dr.polygon(pts, fill=255)  # 255 = área do imóvel
-        # queremos escuro fora -> alpha = shade - hole
-        import numpy as np
-        alpha = np.array(shade, dtype=np.int16) - np.array(hole, dtype=np.int16)
-        alpha = np.clip(alpha, 0, 255).astype("uint8")
+
+        # queremos escuro fora -> alpha = shade - hole (sem numpy)
+        alpha = ImageChops.subtract(shade, hole)
         black = Image.new("RGBA", (Wp, Hp), (0,0,0,0))
-        black.putalpha(Image.fromarray(alpha))
+        black.putalpha(alpha)
         base_img = Image.alpha_composite(base_img, black)
 
     # 2) polígono amarelo
@@ -216,7 +223,8 @@ def draw_overlay_locally(base_img, ring_lonlat, cx, cy, z, W, H, scale,
     dr2.polygon(pts, fill=fill, outline=stroke_rgb, width=max(1, int(stroke_px*scale)))
     base_img = Image.alpha_composite(base_img, overlay)
 
-    return base_img.convert("RGB")
+    return base_img
+
 
 # ======== FIM DOS HELPERS NOVOS QUE BUSCAM SIMPLIFIAR AS FEIÇÕES CONFORME TAMANHO DA ÁREA ========
 
@@ -279,36 +287,21 @@ def centroid_from_ring(r):
     return [cx/(6*A), cy/(6*A)]
 
 # WebMercator helpers
-def lon2x(lon): return (lon + 180.0) / 360.0
-def lat2y(lat):
-    lat = max(-85.05112878, min(85.05112878, lat))
-    r = math.radians(lat)
-    return (1.0 - math.log(math.tan(r) + 1.0/math.cos(r)) / math.pi) / 2.0
 
-def compute_zoom_for_bbox(bbox, W, H, padding=0.10, tile=512):
-    minLon,minLat,maxLon,maxLat = bbox
-    x1,x2 = lon2x(minLon), lon2x(maxLon)
-    y1,y2 = lat2y(maxLat), lat2y(minLat)  # y cresce p/ sul
-    dx = max(1e-9, abs(x2-x1))
-    dy = max(1e-9, abs(y2-y1))
-    innerW = max(1.0, W * (1.0 - 2.0*padding))
-    innerH = max(1.0, H * (1.0 - 2.0*padding))
-    scaleX = innerW / (tile * dx)
-    scaleY = innerH / (tile * dy)
-    z = math.floor(math.log2(max(1e-9, min(scaleX, scaleY))))
-    return int(max(3, min(20, z)))
-
-def lonlat_to_image_px(lon, lat, cx, cy, zoom, W, H, tile=512):
-    # world pixel coords at this zoom (origin = top-left)
+def lonlat_to_image_px(lon, lat, cx, cy, zoom, W, H, tile=512, scale=1):
     n = (2 ** zoom) * tile
     wx = lon2x(lon) * n
     wy = lat2y(lat) * n
     wcx = lon2x(cx) * n
     wcy = lat2y(cy) * n
-    # screen px = delta to center + half of image
-    px = (wx - wcx) + (W / 2.0)
-    py = (wy - wcy) + (H / 2.0)
+    # metade da imagem em pixels reais (já considerando scale)
+    halfW = (W * scale) / 2.0
+    halfH = (H * scale) / 2.0
+    # delta em "world pixels", então multiplica por scale
+    px = (wx - wcx) * scale + halfW
+    py = (wy - wcy) * scale + halfH
     return px, py
+
 
 # ================== KMZ/KML parsing ==================
 def extract_kml_bytes(payload):
@@ -450,13 +443,17 @@ def generate_map():
         out_w = int(q.get("out_w", DEFAULT_W))
         out_h = int(q.get("out_h", DEFAULT_H))
         scale = int(q.get("scale", DEFAULT_SCALE))
-        retina = "@2x" if scale == 2 else ""
+        # força 4:3 (preserva out_w)
+        if out_w * 3 != out_h * 4:
+            out_h = int(round(out_w * 3 / 4.0))
+
+        # scale suportado
+        scale = 2 if scale >= 2 else 1
 
         # Estética
         darken = float(q.get("darken", DEFAULT_DARK))
         poly_alpha = float(q.get("transparencia", q.get("poly_alpha", DEFAULT_POLY_A)))
         pad = float(q.get("padding", DEFAULT_PAD))
-        simp_tol = float(q.get("simplify", DEFAULT_SIMP))
 
         # Títulos / logo
         car_text = q.get("car")  # opcional: aparece como título no topo
@@ -517,9 +514,9 @@ def generate_map():
         overlays = None
         if not draw_local:
             overlays_geojson = fc
-            overlays_encoded = requests.utils.quote(
-                json.dumps(overlays_geojson, separators=(',',':'))
-            ) if requests else json.dumps(overlays_geojson)
+            overlays_encoded = urllib.parse.quote(
+    json.dumps(overlays_geojson, separators=(',',':')), safe=""
+)
             overlays = f"geojson({overlays_encoded})"
             # pin via Mapbox só se não for desenhar localmente
             if have_pin:
@@ -527,7 +524,7 @@ def generate_map():
                 overlays += f",pin-s+{pin_color}({lon},{lat})"
 
         # ===== 4) Baixa a imagem base do Mapbox Static =====
-        retina = f"@{scale}x" if scale in (2,3) else ""
+        retina = f"@{scale}x" if scale == 2 else ""
         if overlays:
             base = f"https://api.mapbox.com/styles/v1/{style}/static/{overlays}/{cx},{cy},{zoom}/{out_w}x{out_h}{retina}"
         else:
@@ -575,6 +572,7 @@ def generate_map():
         if have_pin:
             # coordenadas em pixels (imagem)
             px, py = lonlat_to_image_px(lon, lat, cx, cy, zoom, out_w, out_h, tile=512, scale=scale)
+           
             # se caiu no fallback, desenha o "alfinete" localmente
             if draw_local:
                 rpx = max(3, int(5*scale))
@@ -590,33 +588,47 @@ def generate_map():
                                   font=font, anchor="mb")
 
         # ===== 7) Título CAR + Logo =====
-        if car_text:
-            pad_x = 16; pad_y = 14
-            title = f"CAR: {car_text}"
-            draw_text_with_stroke(draw, (pad_x, pad_y), title, fill="white",
-                                  stroke_fill="black", stroke_width=2*scale,
-                                  font=font, anchor="la")
+        IW, IH = img.size  # tamanho real da imagem (já considera @2x)
 
+        # Título CAR (topo-esquerdo)
+        if car_text:
+            pad_x = int(16 * scale)
+            pad_y = int(14 * scale)
+            title = f"CAR: {car_text}"
+            draw_text_with_stroke(
+                draw, (pad_x, pad_y), title,
+                fill="white",
+                stroke_fill="black",
+                stroke_width=2*scale,
+                font=font,
+                anchor="la"
+            )
+
+        # Logo (topo-direito), dimensionada e posicionada considerando o scale
         try:
             logo = load_logo(logo_url)
             if logo is not None:
-                target_w = int(out_w * 0.30)
-                w,h = logo.size
-                ratio = target_w / float(w)
-                new_h = int(h * ratio)
+                # usa 30% da largura REAL (IW) para a logo — consistente em 1x e 2x
+                target_w = int(IW * 0.30)
+                w, h = logo.size
+                new_h = int(h * (target_w / float(w)))
                 logo = logo.resize((target_w, new_h), Image.LANCZOS)
-                lx = out_w - target_w - 16
-                ly = 12
+
+                pad_px = int(16 * scale)
+                lx = IW - target_w - pad_px
+                ly = int(12 * scale)
                 img.alpha_composite(logo, (lx, ly))
         except Exception as e:
             log.warning(f"Logo skip: {e}")
 
+
         # ===== 8) JPEG saída =====
         out_rgb = img.convert("RGB")
         buf = io.BytesIO()
-        q = int(q.get("jpg_quality", DEFAULT_JPG_Q))
-        q = max(60, min(95, q))
-        out_rgb.save(buf, format="JPEG", quality=q, optimize=True, progressive=True)
+        jpg_q = int(request.args.get("jpg_quality", DEFAULT_JPG_Q))
+        jpg_q = max(60, min(95, jpg_q))
+        out_rgb.save(buf, format="JPEG", quality=jpg_q, optimize=True, progressive=True)
+
         buf.seek(0)
         return send_file(buf, mimetype="image/jpeg", download_name="mapa_smart_fazendas.jpg")
 
