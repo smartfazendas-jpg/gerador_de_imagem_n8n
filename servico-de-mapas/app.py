@@ -156,52 +156,81 @@ def estimate_zoom(extent84, base_width_px=1600):
 # -------------------------
 def gdf_from_kml_string(kml_str: str) -> gpd.GeoDataFrame:
     """
-    Tenta ler via GDAL/Fiona (driver KML). Se o driver não existir, usa fastkml.
-    Retorna GeoDataFrame em EPSG:4326.
+    Lê KML e devolve GeoDataFrame em EPSG:4326.
+    1) Tenta GDAL/Fiona (driver KML); 2) fallback robusto com fastkml,
+       lidando com .features como método OU como lista.
     """
-    # 1) tentativa com GDAL/Fiona (driver KML)
+    # 1) GDAL/Fiona (quando o driver KML estiver presente)
     try:
         gdf = gpd.read_file(io.BytesIO(kml_str.encode("utf-8")), driver="KML")
         if not gdf.empty:
             return gdf.to_crs(4326)
     except Exception as e:
         msg = str(e).lower()
+        # Continua para fastkml; logamos apenas para depuração
         if "unsupported driver" not in msg and "kml" not in msg:
             LOGGER.info(f"read_file(driver='KML') falhou: {e}")
 
-    # 2) fallback com fastkml
+    # 2) Fallback fastkml
     if not HAS_FASTKML:
         raise RuntimeError("unsupported driver: 'KML' (e fastkml não está instalado)")
 
     k = fastkml.KML()
     k.from_string(kml_str.encode("utf-8"))
 
-    def _iter_geoms(feat):
+    def iter_children(obj):
         """
-        Em fastkml, alguns objetos têm .features() (método) e outros têm
-        .features (lista). Precisamos lidar com ambos.
+        Retorna filhos de 'obj' em fastkml, suportando:
+        - obj.features()  -> gerador
+        - obj.features    -> lista/tupla
+        - obj._features   -> lista/tupla (algumas versões/objetos)
         """
-        features_attr = getattr(feat, "features", None)
-        if callable(features_attr):
-            for f in features_attr():
-                yield from _iter_geoms(f)
-        elif isinstance(features_attr, (list, tuple)):
-            for f in features_attr:
-                yield from _iter_geoms(f)
-        else:
-            geom = getattr(feat, "geometry", None)
-            if geom is not None:
-                yield geom
+        feats = getattr(obj, "features", None)
+        if callable(feats):
+            try:
+                for f in feats():
+                    yield f
+            except TypeError:
+                # Em casos muito raros, .features() pode ter assinatura diferente;
+                # ignoramos e avançamos para _features/lista
+                pass
+        if isinstance(feats, (list, tuple)):
+            for f in feats:
+                yield f
+        feats2 = getattr(obj, "_features", None)
+        if isinstance(feats2, (list, tuple)):
+            for f in feats2:
+                yield f
 
+    # Percorre a árvore inteira do KML (sem NENHUM uso de .features() direto)
     geoms = []
-    for feat in k.features():
-        geoms.extend(list(_iter_geoms(feat)))
+    stack = list(iter_children(k))  # <- nada de k.features()
+    while stack:
+        f = stack.pop()
+        geom = getattr(f, "geometry", None)
+        if geom is not None:
+            geoms.append(geom)
+        # empilha filhos
+        for ch in iter_children(f):
+            stack.append(ch)
 
-    polys = [g for g in geoms if isinstance(g, (Polygon, MultiPolygon))]
+    # Filtra apenas polígonos/multipolígonos; se vier coleção, tenta decompor
+    polys = []
+    for g in geoms:
+        if isinstance(g, (Polygon, MultiPolygon)):
+            polys.append(g)
+        else:
+            geoms_attr = getattr(g, "geoms", None)
+            if geoms_attr:
+                for sg in geoms_attr:
+                    if isinstance(sg, (Polygon, MultiPolygon)):
+                        polys.append(sg)
+
     if not polys:
         raise RuntimeError("KML sem geometrias poligonais (fastkml).")
 
     return gpd.GeoDataFrame(geometry=polys, crs="EPSG:4326")
+
 
 
 # --------------------
