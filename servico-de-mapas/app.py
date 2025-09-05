@@ -29,6 +29,13 @@ try:
 except Exception:
     HAS_FASTKML = False
 
+def webmercator_crs():
+    # Usa WebMercator se existir; senão cai no EPSG:3857 (Web Mercator)
+    if hasattr(ccrs, "WebMercator"):
+        return ccrs.WebMercator()
+    return ccrs.epsg(3857)
+
+
 # --------------------
 # Configurações globais
 # --------------------
@@ -464,11 +471,13 @@ def generate_map():
         fig = Figure(dpi=DEFAULT_DPI)
         set_figure_aspect(fig, DEFAULT_FIG_ASPECT)
 
-        proj = ccrs.WebMercator()
+        # compatível com versões antigas/novas do Cartopy
+        proj = webmercator_crs()
         ax = fig.add_subplot(1, 1, 1, projection=proj)
         ax.set_axis_off()
         fig.subplots_adjust(0, 0, 1, 1)
         ax.set_position([0, 0, 1, 1])
+
 
         # tiles
         tiles, prov_label = get_tile_provider(provider_name)
