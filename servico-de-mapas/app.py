@@ -1,95 +1,141 @@
-import os
-import io
-import json # Importa a biblioteca para lidar com JSON
+import os, io, json, base64, math, logging
 import geopandas as gpd
 import matplotlib
-
-# Importante: Define o backend do Matplotlib para 'Agg'.
-# Isso permite que ele rode em um servidor sem ambiente gráfico (sem tela).
 matplotlib.use('Agg')
-
-import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cartopy.crs as ccrs
 import cartopy.io.img_tiles as cimgt
+from shapely.geometry import GeometryCollection
 from flask import Flask, request, send_file, jsonify
 
-# Inicializa a aplicação web com Flask.
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 8 * 1024 * 1024  # 8 MB limite de payload
 
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("generate-map")
 
-# --- Endpoint da API ---
+def _extract_kml_bytes(payload):
+    """
+    Aceita:
+      - [{"data": "<kml>"}]  ou  {"data": "<kml>"}
+      - Base64 com/sem prefixo data:...;base64,
+    Retorna bytes do KML ou lança ValueError.
+    """
+    if payload is None:
+        raise ValueError("JSON ausente ou malformado (Content-Type deve ser application/json).")
 
-# Define a rota '/generate-map' que aceitará requisições do tipo POST.
-@app.route('/generate-map', methods=['POST'])
+    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+        kml_raw = payload[0].get("data")
+    elif isinstance(payload, dict):
+        kml_raw = payload.get("data")
+    else:
+        kml_raw = None
+
+    if not kml_raw or not isinstance(kml_raw, str):
+        raise ValueError("Campo 'data' (string) não encontrado no JSON.")
+
+    s = kml_raw.strip()
+    if s.lower().startswith("data:") and ";base64," in s:
+        s = s.split(",", 1)[1]
+    try:
+        return base64.b64decode(s, validate=True)
+    except Exception:
+        return s.encode("utf-8")
+
+def _read_kml_gdf(kml_bytes):
+    bio = io.BytesIO(kml_bytes)
+    try:
+        return gpd.read_file(bio, driver="LIBKML")
+    except Exception:
+        bio.seek(0)
+        try:
+            return gpd.read_file(bio, driver="KML")
+        except Exception as e:
+            raise RuntimeError(
+                "Falha lendo KML: nenhum driver (LIBKML/KML) disponível no GDAL/Fiona. "
+                f"Detalhes: {e}"
+            )
+
+def _extent_with_padding(geom, pad_ratio=0.10):
+    minx, miny, maxx, maxy = geom.bounds
+    dx = (maxx - minx) or 1e-6
+    dy = (maxy - miny) or 1e-6
+    px, py = dx * pad_ratio, dy * pad_ratio
+    return [minx - px, maxx + px, miny - py, maxy + py]
+
+def _zoom_from_lon_span(minx, maxx):
+    span = max(1e-9, (maxx - minx))
+    z = math.log2(360.0 / span)
+    return int(max(1, min(18, round(z))))
+
+def _extract_cod_imovel(gdf):
+    # procura coluna com nome compatível
+    for col in gdf.columns:
+        lc = col.lower()
+        if lc == "cod_imovel" or "cod_imovel" in lc:
+            series = gdf[col].dropna()
+            if not series.empty:
+                cod = str(series.iloc[0]).strip()
+                if cod:
+                    return cod
+    return None
+
+@app.route("/generate-map", methods=["POST"])
 def generate_map_endpoint():
     try:
-        # ✅ CORREÇÃO: Lê o corpo da requisição como JSON.
-        json_data = request.get_json()
-        if not json_data:
-            return jsonify({"error": "Corpo da requisição JSON está vazio ou malformado."}), 400
+        payload = request.get_json(silent=True)
+        kml_bytes = _extract_kml_bytes(payload)
 
-        # Extrai a string KML de dentro da estrutura JSON: [ { "data": "..." } ]
-        kml_string = json_data[0].get('data')
-        if not kml_string:
-            return jsonify({"error": "Chave 'data' com o conteúdo KML não encontrada no JSON."}), 400
+        gdf = _read_kml_gdf(kml_bytes)
+        if gdf.empty or gdf.geometry.isna().all():
+            return jsonify({"error": "KML sem geometria válida."}), 400
 
-        # Converte a string KML para bytes, que é o que o Geopandas precisa.
-        kml_bytes = kml_string.encode('utf-8')
-
-        print("Recebido JSON com KML. Lendo dados...")
-        
-        # Lê o KML a partir dos bytes que extraímos.
-        gdf = gpd.read_file(io.BytesIO(kml_bytes), driver='KML')
-
-        # Garante que a projeção dos dados esteja no padrão geográfico (WGS84).
         gdf = gdf.to_crs(epsg=4326)
-
-        # Une todos os polígonos do KML em uma única geometria.
         imovel_geom = gdf.unary_union
+        if isinstance(imovel_geom, GeometryCollection) and imovel_geom.is_empty:
+            return jsonify({"error": "Geometria vazia após união."}), 400
 
-        print("Preparando o mapa...")
-        # Define a fonte das imagens de fundo. Usaremos OpenStreetMap.
-        imagery = cimgt.OSM()
+        # define tiles (OSM). Para alto volume, considere provedor com SLA/WMTS.
+        imagery = cimgt.OSM(cache=True)
 
-        # Cria a figura e o eixo do mapa com a projeção correta (Mercator).
-        fig = plt.figure(figsize=(10, 8))
+        fig = Figure(figsize=(10, 8), dpi=150)
+        canvas = FigureCanvas(fig)
         ax = fig.add_subplot(1, 1, 1, projection=imagery.crs)
 
-        # Calcula a "caixa" (bounding box) que envolve o imóvel.
-        bounds = imovel_geom.bounds
-        
-        # Adiciona uma margem de 10%.
-        padding_x = (bounds[2] - bounds[0]) * 0.1
-        padding_y = (bounds[3] - bounds[1]) * 0.1
-        
-        extent = [
-            bounds[0] - padding_x,
-            bounds[2] + padding_x,
-            bounds[1] - padding_y,
-            bounds[3] + padding_y,
-        ]
-        # Define a área de visualização do mapa.
+        extent = _extent_with_padding(imovel_geom, pad_ratio=0.10)
         ax.set_extent(extent, crs=ccrs.PlateCarree())
 
-        # Adiciona a imagem de satélite/mapa de fundo.
-        ax.add_image(imagery, 12, interpolation='spline36')
+        zoom = _zoom_from_lon_span(extent[0], extent[1])
+        try:
+            ax.add_image(imagery, zoom, interpolation="spline36")
+        except Exception as e_tiles:
+            log.warning(f"Falha ao carregar tiles OSM: {e_tiles}. Prosseguindo sem fundo...")
 
-        print("Desenhando polígono...")
-        # Adiciona a geometria do imóvel por cima do mapa de fundo.
-        ax.add_geometries([imovel_geom], crs=ccrs.PlateCarree(),
-                          facecolor='yellow', edgecolor='yellow', linewidth=2, alpha=0.3)
+        ax.add_geometries(
+            [imovel_geom],
+            crs=ccrs.PlateCarree(),
+            facecolor=(1.0, 1.0, 0.0, 0.25),
+            edgecolor=(1.0, 1.0, 0.0, 0.9),
+            linewidth=2,
+        )
+        ax.set_axis_off()
+        fig.tight_layout(pad=0)
 
-        # Salva a imagem gerada em um buffer na memória.
-        img_buffer = io.BytesIO()
-        plt.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight', pad_inches=0)
-        plt.close(fig)
-        img_buffer.seek(0)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", transparent=True, bbox_inches="tight", pad_inches=0)
+        buf.seek(0)
 
-        print("Imagem gerada. Enviando resposta...")
-        # Envia a imagem de volta para o n8n.
-        return send_file(img_buffer, mimetype='image/png')
+        # nome do arquivo pelo cod_imovel, se disponível
+        download_name = (_extract_cod_imovel(gdf) or "mapa") + ".png"
+        return send_file(buf, mimetype="image/png", download_name=download_name)
 
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
     except Exception as e:
-        print(f"Erro no processamento: {e}")
+        log.exception("Erro inesperado")
         return jsonify({"error": str(e)}), 500
 
+if __name__ == "__main__":
+    # Dev: flask run ou python app.py
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
