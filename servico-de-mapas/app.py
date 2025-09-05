@@ -1,5 +1,6 @@
 import os
 import io
+import json # Importa a biblioteca para lidar com JSON
 import geopandas as gpd
 import matplotlib
 
@@ -22,15 +23,23 @@ app = Flask(__name__)
 @app.route('/generate-map', methods=['POST'])
 def generate_map_endpoint():
     try:
-        # Pega o conteúdo binário (o arquivo KML) enviado pelo n8n.
-        kml_data = request.data
-        if not kml_data:
-            return jsonify({"error": "Corpo da requisição (KML) está vazio."}), 400
+        # ✅ CORREÇÃO: Lê o corpo da requisição como JSON.
+        json_data = request.get_json()
+        if not json_data:
+            return jsonify({"error": "Corpo da requisição JSON está vazio ou malformado."}), 400
 
-        print("Recebido KML. Lendo dados...")
+        # Extrai a string KML de dentro da estrutura JSON: [ { "data": "..." } ]
+        kml_string = json_data[0].get('data')
+        if not kml_string:
+            return jsonify({"error": "Chave 'data' com o conteúdo KML não encontrada no JSON."}), 400
+
+        # Converte a string KML para bytes, que é o que o Geopandas precisa.
+        kml_bytes = kml_string.encode('utf-8')
+
+        print("Recebido JSON com KML. Lendo dados...")
         
-        # Com o ambiente correto, o Geopandas ativa o driver KML automaticamente.
-        gdf = gpd.read_file(io.BytesIO(kml_data), driver='KML')
+        # Lê o KML a partir dos bytes que extraímos.
+        gdf = gpd.read_file(io.BytesIO(kml_bytes), driver='KML')
 
         # Garante que a projeção dos dados esteja no padrão geográfico (WGS84).
         gdf = gdf.to_crs(epsg=4326)
