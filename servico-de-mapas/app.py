@@ -159,12 +159,11 @@ def estimate_zoom(extent84, base_width_px=1600):
 def gdf_from_kml_string(kml_str: str) -> gpd.GeoDataFrame:
     """
     Lê KML e devolve GeoDataFrame (EPSG:4326).
-    Ordem de tentativa:
-      1) GDAL/Fiona (driver KML)
-      2) fastkml (robusto, trata .features método ou lista)
-      3) XML manual (ElementTree) — busca Polygons e LinearRings diretamente
+    1) GDAL/Fiona (driver KML)
+    2) fastkml (robusto, lida com .features método ou lista)
+    3) XML manual AGNÓSTICO de namespace (varre por localname: Polygon/LinearRing/coordinates)
     """
-    # 1) GDAL/Fiona (quando disponível)
+    # 1) GDAL/Fiona
     try:
         gdf = gpd.read_file(io.BytesIO(kml_str.encode("utf-8")), driver="KML")
         if not gdf.empty:
@@ -174,7 +173,7 @@ def gdf_from_kml_string(kml_str: str) -> gpd.GeoDataFrame:
         if "unsupported driver" not in msg and "kml" not in msg:
             LOGGER.info(f"read_file(driver='KML') falhou: {e}")
 
-    # 2) Fallback fastkml
+    # 2) fastkml
     if HAS_FASTKML:
         try:
             from shapely.geometry import Polygon, MultiPolygon
@@ -198,7 +197,7 @@ def gdf_from_kml_string(kml_str: str) -> gpd.GeoDataFrame:
                         yield f
 
             geoms = []
-            stack = list(iter_children(k))
+            stack = list(iter_children(k))  # nada de k.features() direto
             while stack:
                 f = stack.pop()
                 geom = getattr(f, "geometry", None)
@@ -223,106 +222,106 @@ def gdf_from_kml_string(kml_str: str) -> gpd.GeoDataFrame:
         except Exception as e:
             LOGGER.info(f"fastkml fallback falhou: {e}")
 
-    # 3) Fallback final: XML manual (ElementTree)
-    #    - Suporta namespaces distintos, MultiGeometry, furos (innerBoundaryIs).
-    try:
-        ns = {
-            "kml": "http://www.opengis.net/kml/2.2",
-            "gx":  "http://www.google.com/kml/ext/2.2",
-        }
-        root = ET.fromstring(kml_str.encode("utf-8"))
+    # 3) XML manual agnóstico de namespace
+    import xml.etree.ElementTree as ET
+    from shapely.geometry import Polygon, MultiPolygon
 
-        # helper p/ ler string "lon,lat[,alt] lon,lat[,alt] ..."
-        def parse_coords(txt):
-            coords = []
-            for token in (txt or "").replace("\n", " ").replace("\t", " ").split():
-                parts = token.split(",")
-                if len(parts) >= 2:
-                    try:
-                        lon = float(parts[0]); lat = float(parts[1])
-                        coords.append((lon, lat))
-                    except ValueError:
-                        continue
+    def strip_ns(tag):
+        return tag.split('}')[-1] if isinstance(tag, str) else tag
+
+    def parse_coords(text):
+        coords = []
+        if not text:
             return coords
-
-        from shapely.geometry import Polygon, MultiPolygon, LinearRing
-        polys = []
-
-        # pega todos os Polygon em qualquer profundidade
-        # cobre casos com/sem prefixo de namespace usando buscas alternativas
-        polygon_tags = [
-            ".//{http://www.opengis.net/kml/2.2}Polygon",
-            ".//kml:Polygon",
-        ]
-        inner_tags = [
-            "{http://www.opengis.net/kml/2.2}innerBoundaryIs",
-            "kml:innerBoundaryIs",
-        ]
-        outer_tag1 = "{http://www.opengis.net/kml/2.2}outerBoundaryIs"
-        outer_tag2 = "kml:outerBoundaryIs"
-        ring_tags = [
-            "{http://www.opengis.net/kml/2.2}LinearRing",
-            "kml:LinearRing",
-        ]
-        coords_tags = [
-            "{http://www.opengis.net/kml/2.2}coordinates",
-            "kml:coordinates",
-        ]
-
-        # busca Polygons
-        found_polys = []
-        for tag in polygon_tags:
-            found_polys.extend(root.findall(tag, ns))
-
-        for poly in found_polys:
-            # OUTER
-            outer_coords = None
-            outer = poly.find(outer_tag1, ns) or poly.find(outer_tag2, ns)
-            if outer is not None:
-                ring = None
-                for rt in ring_tags:
-                    ring = outer.find(rt, ns) or ring
-                if ring is not None:
-                    coord_el = None
-                    for ct in coords_tags:
-                        coord_el = ring.find(ct, ns) or coord_el
-                    if coord_el is not None and coord_el.text:
-                        oc = parse_coords(coord_el.text)
-                        if len(oc) >= 3:
-                            outer_coords = oc
-
-            # INNERS
-            holes = []
-            for itag in inner_tags:
-                for ib in poly.findall(itag, ns):
-                    ring = None
-                    for rt in ring_tags:
-                        ring = ib.find(rt, ns) or ring
-                    if ring is not None:
-                        coord_el = None
-                        for ct in coords_tags:
-                            coord_el = ring.find(ct, ns) or coord_el
-                        if coord_el is not None and coord_el.text:
-                            ic = parse_coords(coord_el.text)
-                            if len(ic) >= 3:
-                                holes.append(ic)
-
-            if outer_coords:
+        for token in text.replace("\n", " ").replace("\t", " ").split():
+            parts = token.split(",")
+            if len(parts) >= 2:
                 try:
-                    p = Polygon(outer_coords, holes)
+                    lon = float(parts[0]); lat = float(parts[1])
+                    coords.append((lon, lat))
+                except ValueError:
+                    continue
+        return coords
+
+    def find_first_local(parent, localname):
+        for el in parent.iter():
+            if strip_ns(el.tag) == localname:
+                return el
+        return None
+
+    def find_all_local(parent, localname):
+        for el in parent.iter():
+            if strip_ns(el.tag) == localname:
+                yield el
+
+    try:
+        root = ET.fromstring(kml_str.encode("utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"KML inválido (XML). {e}")
+
+    polys = []
+    # Varre TODOS os <Polygon> independente de prefixo/namespace
+    for poly in root.iter():
+        if strip_ns(poly.tag) != "Polygon":
+            continue
+
+        # OUTER
+        outer = find_first_local(poly, "outerBoundaryIs")
+        outer_coords = []
+        if outer is not None:
+            lr = find_first_local(outer, "LinearRing")
+            if lr is not None:
+                coords_el = find_first_local(lr, "coordinates")
+                if coords_el is not None:
+                    outer_coords = parse_coords(coords_el.text)
+
+        # INNERS
+        holes = []
+        for ib in find_all_local(poly, "innerBoundaryIs"):
+            lr = find_first_local(ib, "LinearRing")
+            if lr is not None:
+                coords_el = find_first_local(lr, "coordinates")
+                if coords_el is not None:
+                    ic = parse_coords(coords_el.text)
+                    if len(ic) >= 3:
+                        # fecha o anel, se necessário
+                        if ic[0] != ic[-1]:
+                            ic.append(ic[0])
+                        holes.append(ic)
+
+        if len(outer_coords) >= 3:
+            if outer_coords[0] != outer_coords[-1]:
+                outer_coords.append(outer_coords[0])
+            try:
+                p = Polygon(outer_coords, holes)
+                if p.is_valid and not p.is_empty and p.area > 0:
+                    polys.append(p)
+            except Exception:
+                # Ignora outer inválido
+                pass
+
+    if not polys:
+        # Tenta caso de MultiGeometry contendo <coordinates> direto (raríssimo)
+        # Como fallback extremo: pegar qualquer <coordinates> e formar um polígono único
+        coords_texts = [el.text for el in root.iter() if strip_ns(el.tag) == "coordinates" and el.text]
+        for txt in coords_texts:
+            pts = parse_coords(txt)
+            if len(pts) >= 3:
+                if pts[0] != pts[-1]:
+                    pts.append(pts[0])
+                try:
+                    p = Polygon(pts)
                     if p.is_valid and not p.is_empty and p.area > 0:
                         polys.append(p)
+                        break
                 except Exception:
-                    # ignora polígonos problemáticos
                     pass
 
-        if not polys:
-            raise RuntimeError("KML sem geometrias poligonais (XML).")
+    if not polys:
+        raise RuntimeError("KML sem geometrias poligonais (parser XML agnóstico).")
 
-        return gpd.GeoDataFrame(geometry=polys, crs="EPSG:4326")
+    return gpd.GeoDataFrame(geometry=polys, crs="EPSG:4326")
 
-    except Exception as e:
-        raise RuntimeError(f"KML sem geometrias poligonais (fastkml).") from e
 
 
 
