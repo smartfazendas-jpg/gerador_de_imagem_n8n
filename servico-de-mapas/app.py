@@ -16,13 +16,13 @@ from shapely.ops import unary_union
 from PIL import Image
 from flask import Flask, request, send_file, jsonify
 
-# HTTP (logo/tiles)
+# HTTP opcional (logo/tiles)
 try:
     import requests
 except Exception:
     requests = None
 
-# fastkml fallback
+# fastkml opcional
 try:
     from fastkml import kml as fastkml_mod
 except Exception:
@@ -177,9 +177,7 @@ def _zoom_from_lon_span(minx, maxx):
     return int(max(1, min(18, round(z))))
 
 def _extent_from_center_zoom(lon, lat, zoom):
-    # largura em graus (aprox webmercator)
     lon_span = 360.0 / (2 ** zoom)
-    # corrigir latitude
     lat_span = lon_span / max(0.2, math.cos(math.radians(lat)))
     return [lon - lon_span/2, lon + lon_span/2, lat - lat_span/2, lat + lat_span/2]
 
@@ -232,6 +230,30 @@ def _add_logo(ax, pil_img, width_px=220):
     ab = AnnotationBbox(imagebox, (0.985, 0.985), xycoords='axes fraction',
                         frameon=False, box_alignment=(1,1), pad=0)
     ax.add_artist(ab)
+
+# -------- ocultar eixos/bordas de modo compatível
+def hide_axes(ax):
+    """Esconde contornos/bordas do eixo de forma compatível com várias versões."""
+    try:
+        ax.set_axis_off()
+    except Exception:
+        pass
+    try:
+        op = getattr(ax, "outline_patch", None)
+        if op is not None:
+            op.set_visible(False)
+    except Exception:
+        pass
+    try:
+        for sp in getattr(ax, "spines", {}).values():
+            sp.set_visible(False)
+    except Exception:
+        pass
+    try:
+        if hasattr(ax, "patch") and ax.patch is not None:
+            ax.patch.set_visible(False)
+    except Exception:
+        pass
 
 # ------------------ XYZ manual (sem ImageTiles) ------------------
 def _lonlat_to_pixel(lon, lat, z, tile_size=256):
@@ -341,7 +363,7 @@ def generate_map():
         cod = _extract_cod_imovel(gdf)
         label_text = f"CAR: {cod}" if cod else "CAR"
 
-        # ===== Figura ocupando 100% (sem borda) =====
+        # ===== Figura (sem bordas) =====
         fig = Figure(figsize=(10, 8), dpi=150); fig.set_facecolor("white")
         canvas = FigureCanvas(fig)
 
@@ -349,7 +371,6 @@ def generate_map():
         if geom is not None:
             extent84 = _extent_with_padding(geom, pad_ratio=0.10)
             zoom = _zoom_from_lon_span(extent84[0], extent84[1])
-            # incluir o pino no enquadramento (se existir)
             if pin_lat is not None and pin_lon is not None:
                 minx, maxx, miny, maxy = extent84
                 minx = min(minx, pin_lon); maxx = max(maxx, pin_lon)
@@ -383,27 +404,7 @@ def generate_map():
             ax.imshow(img_bg, extent=wm_extent, transform=ccrs.epsg(3857),
                       origin="upper", interpolation="bilinear", zorder=1)
 
-        ax.set_axis_off()
-# Esconde contornos de forma compatível com várias versões
-try:
-    op = getattr(ax, "outline_patch", None)
-    if op is not None:
-        op.set_visible(False)
-except Exception:
-    pass
-
-# Em algumas versões, os "spines" é que aparecem
-for sp in getattr(ax, "spines", {}).values():
-    try:
-        sp.set_visible(False)
-    except Exception:
-        pass
-
-# Eixo/painel de fundo (apenas por garantia)
-try:
-    ax.patch.set_visible(False)
-except Exception:
-    pass
+        hide_axes(ax)
 
         # ===== Máscara externa escura =====
         if geom is not None:
@@ -440,14 +441,13 @@ except Exception:
             ax.scatter([pin_lon],[pin_lat], transform=ccrs.PlateCarree(),
                        s=80, zorder=9, marker='o', facecolor=pin_color,
                        edgecolor='white', linewidth=1.8)
-            # texto da coordenada acima do pino
             txt_label = pin_text if pin_text else f"{pin_lat:.5f}, {pin_lon:.5f}"
             ax.annotate(txt_label, xy=(pin_lon, pin_lat), xycoords=ccrs.PlateCarree()._as_mpl_transform(ax),
                         xytext=(0, 12), textcoords='offset points', ha='center', va='bottom',
                         fontsize=10, color='white',
                         path_effects=[pe.withStroke(linewidth=3.0, foreground='black')], zorder=10)
 
-        # ===== Rótulo CAR dentro do polígono =====
+        # ===== Rótulo CAR =====
         if geom is not None:
             angle = _principal_orientation(geom)
             cx, cy = geom.centroid.x, geom.centroid.y
