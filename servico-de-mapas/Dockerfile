@@ -1,27 +1,24 @@
-# Usa a imagem oficial e mais recente do OSGeo que está no GitHub Container Registry (ghcr.io)
-# Esta imagem já vem com GDAL e todas as dependências de sistema corretamente configuradas.
-FROM ghcr.io/osgeo/gdal:ubuntu-full-latest
+# Imagem com conda-forge pré-configurada (resolve GDAL/GEOS/PROJ)
+FROM mambaorg/micromamba:1.5.8-jammy
 
-# Define o diretório de trabalho.
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+USER $MAMBA_USER
+
+# Cria env com todas as libs nativas prontas
+RUN micromamba create -y -n app -c conda-forge \
+    python=3.11 flask requests geopandas cartopy matplotlib pillow gdal fiona shapely pyproj \
+ && micromamba clean -a -y
+SHELL ["bash", "-lc"]
+ENV PATH=/opt/conda/envs/app/bin:$PATH
+
 WORKDIR /app
+COPY . /app
 
-# A imagem base já vem com Python e pip.
-# Garante que o pip para Python 3 está instalado e atualizado.
-RUN apt-get update && apt-get install -y python3-pip
+# Porta do serviço
+ENV PORT=5000
+EXPOSE 5000
 
-# Copia a nossa lista de dependências Python.
-COPY requirements.txt .
-
-# Instala as bibliotecas Python.
-# O --break-system-packages é necessário em imagens mais novas para permitir a instalação via pip.
-RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
-
-# Copia o código da nossa aplicação.
-COPY . .
-
-# Expõe a porta 80.
-EXPOSE 80
-
-# Comando para iniciar o servidor web Flask.
-CMD ["flask", "run", "--host=0.0.0.0", "--port=80"]
-
+# Produção: gunicorn (mais estável que flask run)
+CMD ["bash", "-lc", "tini -g -- gunicorn app:app -w 2 -k gthread -b 0.0.0.0:${PORT} --timeout 120"]
