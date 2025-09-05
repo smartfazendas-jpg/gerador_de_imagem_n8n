@@ -372,7 +372,24 @@ def generate_map():
 
 @app.get("/health")
 def health():
-    return {"ok": True}, 200
+    import cartopy, matplotlib, shapely
+    info = {
+        "ok": True,
+        "versions": {
+            "cartopy": getattr(cartopy, "__version__", "unknown"),
+            "matplotlib": getattr(matplotlib, "__version__", "unknown"),
+            "geopandas": getattr(gpd, "__version__", "unknown"),
+            "shapely": getattr(shapely, "__version__", "unknown"),
+        },
+        "has_imgtiles": hasattr(cimgt, "ImageTiles"),
+        "tile_default": DEFAULT_PROVIDER,
+    }
+    if request.args.get("diag", "0").lower() in ("1", "true"):
+        src, name = _make_tile_source(DEFAULT_PROVIDER)
+        info["tile_provider_selected"] = name
+        info["tile_src_type"] = src.__class__.__name__
+    return info, 200
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","5000")))
