@@ -1,4 +1,3 @@
-# app.py
 import os, io, json, base64, math, logging, random
 import geopandas as gpd
 import matplotlib
@@ -15,7 +14,19 @@ from shapely.ops import unary_union
 from PIL import Image
 from flask import Flask, request, send_file, jsonify
 
-# --- Config ---
+# --- extras opcionais ---
+try:
+    import requests  # para baixar a logo (cai para urllib se não existir)
+except Exception:
+    requests = None
+
+# fastkml (fallback quando GDAL não tem driver KML/LIBKML)
+try:
+    from fastkml import kml as fastkml_mod
+except Exception:
+    fastkml_mod = None
+
+# ------------------ Config ------------------
 DEFAULT_PROVIDER = os.getenv("TILE_PROVIDER", "google_hybrid")  # google_hybrid | mapbox_hybrid | osm
 GOOGLE_TEMPLATES = [
     "https://mt0.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
@@ -36,13 +47,7 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH_MB * 1024 * 1024
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("generate-map")
 
-# --- Dependências opcionais (para logo) ---
-try:
-    import requests
-except Exception:
-    requests = None
-
-# --- Compat: ImageTiles pode não existir em algumas versões do Cartopy ---
+# ------------------ Tiles (compat com e sem ImageTiles) ------------------
 HAS_IMGTILES = hasattr(cimgt, "ImageTiles")
 
 if HAS_IMGTILES:
@@ -56,9 +61,7 @@ if HAS_IMGTILES:
 else:
     XYZTiles = None  # sem suporte a XYZ genérico nesta versão do cartopy
 
-# --- Funções auxiliares ---
 def _make_tile_source(provider: str):
-    # Preferir Google/Mapbox se houver suporte a XYZ genérico
     if provider == "google_hybrid" and XYZTiles is not None:
         template = random.choice(GOOGLE_TEMPLATES)
         return XYZTiles(template, cache=True, user_agent=USER_AGENT), "Google Hybrid"
@@ -66,12 +69,12 @@ def _make_tile_source(provider: str):
         mb_url = ("https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/tiles/256/"
                   "{z}/{x}/{y}@2x?access_token=" + MAPBOX_TOKEN)
         return XYZTiles(mb_url, cache=True, user_agent=USER_AGENT), "Mapbox Satellite-Streets"
-    # Fallback universal (sempre existe)
-    return cimgt.OSM(cache=True, user_agent=USER_AGENT), "OpenStreetMap"
+    return cimgt.OSM(cache=True, user_agent=USER_AGENT), "OpenStreetMap"  # fallback universal
 
+# ------------------ Util ------------------
 def _extract_kml_bytes(payload):
     if payload is None:
-        raise ValueError("JSON ausente ou malformado (Content-Type deve ser application/json).")
+        raise ValueError("JSON ausente ou malformado (Content-Type: application/json).")
     if isinstance(payload, list) and payload and isinstance(payload[0], dict):
         kml_raw = payload[0].get("data")
     elif isinstance(payload, dict):
@@ -91,11 +94,50 @@ def _extract_kml_bytes(payload):
 def _read_kml_gdf(kml_bytes):
     import io
     bio = io.BytesIO(kml_bytes)
-    try:
-        return gpd.read_file(bio, driver="LIBKML")
-    except Exception:
-        bio.seek(0)
-        return gpd.read_file(bio, driver="KML")
+
+    # 1) Tenta drivers GDAL se existirem
+    for drv in ("LIBKML", "KML"):
+        try:
+            bio.seek(0)
+            return gpd.read_file(bio, driver=drv)
+        except Exception:
+            pass
+
+    # 2) Fallback: fastkml (sem GDAL)
+    if fastkml_mod is None:
+        raise RuntimeError(
+            "Drivers GDAL KML/LIBKML indisponíveis e 'fastkml' não instalado. "
+            "Inclua 'fastkml' na imagem (vide Dockerfile abaixo)."
+        )
+
+    k = fastkml_mod.KML()
+    k.from_string(kml_bytes)
+
+    from shapely.geometry import shape
+    geoms, props = [], []
+
+    def walk(feat):
+        if hasattr(feat, "features"):
+            for f in feat.features():
+                yield from walk(f)
+        else:
+            yield feat
+
+    for f in walk(k):
+        geom = getattr(f, "geometry", None)
+        if geom:
+            geoms.append(shape(geom.__geo_interface__))
+            p = {}
+            ed = getattr(f, "extended_data", None)
+            if ed:
+                for el in getattr(ed, "elements", []):
+                    p[el.name] = el.value
+            props.append(p)
+
+    if not geoms:
+        raise RuntimeError("KML sem geometrias (fastkml).")
+
+    return gpd.GeoDataFrame(props, geometry=geoms, crs="EPSG:4326")
 
 def _extent_with_padding(geom, pad_ratio=0.10):
     minx, miny, maxx, maxy = geom.bounds
@@ -161,7 +203,7 @@ def _add_logo(ax, pil_img, width_px=220):
                         frameon=False, box_alignment=(1,1), pad=0)
     ax.add_artist(ab)
 
-# --- Endpoints ---
+# ------------------ Endpoints ------------------
 @app.route("/generate-map", methods=["POST"])
 def generate_map():
     try:
