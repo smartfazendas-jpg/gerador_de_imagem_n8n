@@ -45,11 +45,10 @@ def _lat2y(lat):
     lat = max(-85.05112878, min(85.05112878, lat))  # << clamp importante
     r = math.radians(lat)
     return (1.0 - math.log(math.tan(r) + 1.0/math.cos(r)) / math.pi) / 2.0
-    
-# <<< ADICIONE ESTAS DUAS LINHAS >>>
+
+# aliases usadas mais abaixo
 lon2x = _lon2x
 lat2y = _lat2y
-# <<< FIM >>>
 
 def meters_per_pixel(lat_deg, z, tile_size=TILE_SIZE):
     return (math.cos(math.radians(lat_deg)) * 2*math.pi*R_MERC) / (tile_size * (2**z))
@@ -479,7 +478,7 @@ def generate_map():
         if not ring:
             return jsonify({"error":"KML/KMZ sem anel poligonal válido."}), 400
 
-               # ===== 1) Enquadra e escolhe centro/zoom =====
+        # ===== 1) Enquadra e escolhe centro/zoom =====
         bbox = bbox_from_ring(ring)  # [minLon, minLat, maxLon, maxLat]
         cx, cy = centroid_from_ring(ring)
         if have_pin and q.get("center_on_pin", "0").lower() in ("1","true","yes"):
@@ -515,8 +514,8 @@ def generate_map():
         if not draw_local:
             overlays_geojson = fc
             overlays_encoded = urllib.parse.quote(
-    json.dumps(overlays_geojson, separators=(',',':')), safe=""
-)
+                json.dumps(overlays_geojson, separators=(',',':')), safe=""
+            )
             overlays = f"geojson({overlays_encoded})"
             # pin via Mapbox só se não for desenhar localmente
             if have_pin:
@@ -529,7 +528,7 @@ def generate_map():
             base = f"https://api.mapbox.com/styles/v1/{style}/static/{overlays}/{cx},{cy},{zoom}/{out_w}x{out_h}{retina}"
         else:
             # sem overlay no URL (vai desenhar localmente)
-            base = f"https://api.mapbox.com/styles/v1/{style}/static/{cx},{cy},{zoom}/{out_w}x{out_h}{retina}"
+            base = f"https://api.mapbox.com/styles/v1/{style}/static/{cx},{cy}/{zoom}/{out_w}x{out_h}{retina}"
 
         static_url = f"{base}?access_token={token}&logo=false&attribution=false"
 
@@ -572,7 +571,7 @@ def generate_map():
         if have_pin:
             # coordenadas em pixels (imagem)
             px, py = lonlat_to_image_px(lon, lat, cx, cy, zoom, out_w, out_h, tile=512, scale=scale)
-           
+
             # se caiu no fallback, desenha o "alfinete" localmente
             if draw_local:
                 rpx = max(3, int(5*scale))
@@ -621,25 +620,15 @@ def generate_map():
         except Exception as e:
             log.warning(f"Logo skip: {e}")
 
-
         # ===== 8) JPEG saída =====
         out_rgb = img.convert("RGB")
         buf = io.BytesIO()
         jpg_q = int(request.args.get("jpg_quality", DEFAULT_JPG_Q))
         jpg_q = max(60, min(95, jpg_q))
         out_rgb.save(buf, format="JPEG", quality=jpg_q, optimize=True, progressive=True)
-
-        buf.seek(0)
-        f, mimetype="image/jpeg", download_name="mapa_smart_fazendas.jpg")
-
-
-@app.post("/generate-map")
-def generate_map():
-    try:
-        q = request.args
-        # ... todo o seu código atual da função ...
         buf.seek(0)
         return send_file(buf, mimetype="image/jpeg", download_name="mapa_smart_fazendas.jpg")
+
     except Exception as e:
         log.exception("generate_map failed")
         return jsonify({
