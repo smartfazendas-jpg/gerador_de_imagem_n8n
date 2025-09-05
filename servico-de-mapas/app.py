@@ -5,6 +5,10 @@ from flask import Flask, request, send_file, jsonify
 from PIL import Image, ImageDraw, ImageFont
 import xml.etree.ElementTree as ET
 
+# >>> importe urllib no topo (parse e request) <<<
+import urllib.parse
+import urllib.request
+
 try:
     import requests
 except Exception:
@@ -28,7 +32,6 @@ UA            = os.getenv("TILE_USER_AGENT", "SmartFazendas/1.0")
 
 # ================== Helpers geom (JS -> PY) ==================
 # ======== WebMercator & URL-safe simplificação (DP em pixels) ========
-import urllib.parse
 
 TILE_SIZE = 512
 R_MERC = 6378137.0
@@ -42,11 +45,11 @@ def _inv_m_y(y): return math.degrees(2*math.atan(math.exp(y/R_MERC)) - math.pi/2
 
 def _lon2x(lon): return (lon + 180.0) / 360.0
 def _lat2y(lat):
-    lat = max(-85.05112878, min(85.05112878, lat))  # << clamp importante
+    lat = max(-85.05112878, min(85.05112878, lat))  # clamp importante
     r = math.radians(lat)
     return (1.0 - math.log(math.tan(r) + 1.0/math.cos(r)) / math.pi) / 2.0
 
-# aliases usadas mais abaixo
+# aliases
 lon2x = _lon2x
 lat2y = _lat2y
 
@@ -224,9 +227,7 @@ def draw_overlay_locally(base_img, ring_lonlat, cx, cy, z, W, H, scale,
 
     return base_img
 
-
-# ======== FIM DOS HELPERS NOVOS QUE BUSCAM SIMPLIFIAR AS FEIÇÕES CONFORME TAMANHO DA ÁREA ========
-
+# ======== FIM DOS HELPERS NOVOS ========
 
 def get_sq_seg_dist(p, p1, p2):
     x, y = p1; dx, dy = p2[0]-x, p2[1]-y
@@ -272,7 +273,6 @@ def bbox_from_ring(r):
     return [minLon, minLat, maxLon, maxLat]
 
 def centroid_from_ring(r):
-    # centróide de polígono (shoelace)
     A = 0.0; cx = 0.0; cy = 0.0
     for i in range(len(r)-1):
         x0,y0 = r[i]; x1,y1 = r[i+1]
@@ -280,12 +280,9 @@ def centroid_from_ring(r):
         A += cross; cx += (x0+x1)*cross; cy += (y0+y1)*cross
     A *= 0.5
     if abs(A) < 1e-12:
-        # fallback: média simples
         xs = sum(p[0] for p in r)/len(r); ys = sum(p[1] for p in r)/len(r)
         return [xs, ys]
     return [cx/(6*A), cy/(6*A)]
-
-# WebMercator helpers
 
 def lonlat_to_image_px(lon, lat, cx, cy, zoom, W, H, tile=512, scale=1):
     n = (2 ** zoom) * tile
@@ -293,14 +290,11 @@ def lonlat_to_image_px(lon, lat, cx, cy, zoom, W, H, tile=512, scale=1):
     wy = lat2y(lat) * n
     wcx = lon2x(cx) * n
     wcy = lat2y(cy) * n
-    # metade da imagem em pixels reais (já considerando scale)
     halfW = (W * scale) / 2.0
     halfH = (H * scale) / 2.0
-    # delta em "world pixels", então multiplica por scale
     px = (wx - wcx) * scale + halfW
     py = (wy - wcy) * scale + halfH
     return px, py
-
 
 # ================== KMZ/KML parsing ==================
 def extract_kml_bytes(payload):
@@ -329,7 +323,6 @@ def kml_from_kmz_or_kml(kbytes):
     # KMZ zip?
     try:
         with zipfile.ZipFile(io.BytesIO(kbytes)) as zf:
-            # pega o 1º .kml
             for name in zf.namelist():
                 if name.lower().endswith(".kml"):
                     with zf.open(name) as fh:
@@ -343,27 +336,20 @@ def kml_from_kmz_or_kml(kbytes):
         return None
 
 def first_polygon_ring_from_kml(kml_text):
-    """
-    Procura o primeiro <Polygon> e retorna o anel externo como [[lon,lat],...].
-    Se não encontrar, tenta o primeiro <coordinates> em qualquer lugar.
-    """
     if not kml_text:
         return None
     try:
         root = ET.fromstring(kml_text)
     except Exception:
-        # pequenos ajustes caso tenha namespaces inesperados
         try:
             root = ET.fromstring(kml_text.encode("utf-8", errors="ignore"))
         except Exception:
             return None
-    # descobrir ns KML
     ns = ""
     if root.tag.startswith("{"):
         ns = root.tag.split("}")[0].strip("{")
     def q(tag): return f"{{{ns}}}{tag}" if ns else tag
 
-    # Tenta Polygon->outerBoundaryIs->LinearRing->coordinates
     for poly in root.findall(f".//{q('Polygon')}"):
         coords_el = poly.find(f".//{q('outerBoundaryIs')}/{q('LinearRing')}/{q('coordinates')}")
         if coords_el is None:
@@ -376,11 +362,11 @@ def first_polygon_ring_from_kml(kml_text):
                     try:
                         lon = float(parts[0]); lat = float(parts[1])
                         ring.append([lon, lat])
-                    except: pass
+                    except:
+                        pass
             if len(ring) >= 3:
                 return close_ring_if_needed(ring)
 
-    # fallback: primeiro coordinates encontrado
     coords_el = root.find(f".//{q('coordinates')}")
     if coords_el is not None and coords_el.text:
         ring = []
@@ -390,10 +376,10 @@ def first_polygon_ring_from_kml(kml_text):
                 try:
                     lon = float(parts[0]); lat = float(parts[1])
                     ring.append([lon, lat])
-                except: pass
+                except:
+                    pass
         if len(ring) >= 3:
             return close_ring_if_needed(ring)
-
     return None
 
 # ================== Logo loader ==================
@@ -404,7 +390,6 @@ def load_logo(url):
         return _logo_cache
     try:
         if requests is None:
-            import urllib.request
             req = urllib.request.Request(url, headers={"User-Agent": UA})
             with urllib.request.urlopen(req, timeout=12) as r:
                 data = r.read()
@@ -420,7 +405,6 @@ def load_logo(url):
 
 def draw_text_with_stroke(draw, xy, text, fill, stroke_fill, stroke_width, font=None, anchor=None):
     x, y = xy
-    # 8 direções + centro
     offs = [(-1,-1),(0,-1),(1,-1),(-1,0),(1,0),(-1,1),(0,1),(1,1)]
     for dx,dy in offs:
         draw.text((x+dx*stroke_width, y+dy*stroke_width), text, font=font, fill=stroke_fill, anchor=anchor)
@@ -442,11 +426,8 @@ def generate_map():
         out_w = int(q.get("out_w", DEFAULT_W))
         out_h = int(q.get("out_h", DEFAULT_H))
         scale = int(q.get("scale", DEFAULT_SCALE))
-        # força 4:3 (preserva out_w)
         if out_w * 3 != out_h * 4:
             out_h = int(round(out_w * 3 / 4.0))
-
-        # scale suportado
         scale = 2 if scale >= 2 else 1
 
         # Estética
@@ -455,7 +436,7 @@ def generate_map():
         pad = float(q.get("padding", DEFAULT_PAD))
 
         # Títulos / logo
-        car_text = q.get("car")  # opcional: aparece como título no topo
+        car_text = q.get("car")
         logo_url = q.get("logo_url", DEFAULT_LOGO)
 
         # Pin opcional
@@ -478,18 +459,18 @@ def generate_map():
         if not ring:
             return jsonify({"error":"KML/KMZ sem anel poligonal válido."}), 400
 
-        # ===== 1) Enquadra e escolhe centro/zoom =====
-        bbox = bbox_from_ring(ring)  # [minLon, minLat, maxLon, maxLat]
+        # ===== 1) Centro/zoom =====
+        bbox = bbox_from_ring(ring)
         cx, cy = centroid_from_ring(ring)
         if have_pin and q.get("center_on_pin", "0").lower() in ("1","true","yes"):
             cx, cy = float(lon), float(lat)
-        zoom = compute_zoom_for_bbox(bbox, out_w, out_h, padding=pad)  # usa tile=512
+        zoom = compute_zoom_for_bbox(bbox, out_w, out_h, padding=pad)
 
-        # ext84 no formato [minlon, maxlon, minlat, maxlat]
+        # ext84 [minlon, maxlon, minlat, maxlat]
         ext84 = [bbox[0], bbox[2], bbox[1], bbox[3]]
 
-        # ===== 2) Simplificação "em pixels" + proteção de cantos =====
-        url_budget = int(q.get("url_budget", "7000"))  # margem contra 414/422
+        # ===== 2) Simplificação =====
+        url_budget = int(q.get("url_budget", "7000"))
         fc, meta = simplify_ring_for_url(
             ring_lonlat=ring,
             ext84=ext84,
@@ -504,12 +485,11 @@ def generate_map():
             shadow_opacity=darken,
             poly_alpha=poly_alpha
         )
-        ring_simpl = meta["ring"]  # anel simplificado (lon/lat)
+        ring_simpl = meta["ring"]
 
-        # ===== 3) Decide: overlay via URL ou fallback local =====
+        # ===== 3) Decide overlay via URL ou fallback local =====
         draw_local = (meta["encoded_len"] > url_budget)
 
-        # Monta overlays se for usar no URL
         overlays = None
         if not draw_local:
             overlays_geojson = fc
@@ -517,25 +497,21 @@ def generate_map():
                 json.dumps(overlays_geojson, separators=(',',':')), safe=""
             )
             overlays = f"geojson({overlays_encoded})"
-            # pin via Mapbox só se não for desenhar localmente
             if have_pin:
                 pin_color = pin_color.lstrip("#")
                 overlays += f",pin-s+{pin_color}({lon},{lat})"
 
-        # ===== 4) Baixa a imagem base do Mapbox Static =====
+        # ===== 4) Baixa imagem do Mapbox Static =====
         retina = f"@{scale}x" if scale == 2 else ""
         if overlays:
             base = f"https://api.mapbox.com/styles/v1/{style}/static/{overlays}/{cx},{cy},{zoom}/{out_w}x{out_h}{retina}"
         else:
-            # sem overlay no URL (vai desenhar localmente)
-            base = f"https://api.mapbox.com/styles/v1/{style}/static/{cx},{cy}/{zoom}/{out_w}x{out_h}{retina}"
-
+            base = f"https://api.mapbox.com/styles/v1/{style}/static/{cx},{cy},{zoom}/{out_w}x{out_h}{retina}"
         static_url = f"{base}?access_token={token}&logo=false&attribution=false"
 
         headers = {"User-Agent": UA}
         try:
             if requests is None:
-                import urllib.request
                 req = urllib.request.Request(static_url, headers=headers)
                 with urllib.request.urlopen(req, timeout=20) as r:
                     map_bytes = r.read()
@@ -549,11 +525,11 @@ def generate_map():
 
         img = Image.open(io.BytesIO(map_bytes)).convert("RGBA")
 
-        # ===== 5) Fallback: desenha sombra + polígono localmente se necessário =====
+        # ===== 5) Fallback: desenha local =====
         if draw_local:
             img = draw_overlay_locally(
                 base_img=img,
-                ring_lonlat=ring_simpl,  # usa o simplificado protegido
+                ring_lonlat=ring_simpl,
                 cx=cx, cy=cy, z=zoom,
                 W=out_w, H=out_h, scale=scale,
                 poly_alpha=poly_alpha,
@@ -561,7 +537,7 @@ def generate_map():
                 stroke_px=3, stroke_rgb=(255,225,74)
             )
 
-        # ===== 6) Pin + rótulos (sempre por cima) =====
+        # ===== 6) Pin + rótulos =====
         draw = ImageDraw.Draw(img)
         try:
             font = ImageFont.load_default()
@@ -569,27 +545,19 @@ def generate_map():
             font = None
 
         if have_pin:
-            # coordenadas em pixels (imagem)
             px, py = lonlat_to_image_px(lon, lat, cx, cy, zoom, out_w, out_h, tile=512, scale=scale)
-
-            # se caiu no fallback, desenha o "alfinete" localmente
             if draw_local:
                 rpx = max(3, int(5*scale))
-                # borda branca
                 draw.ellipse((px-rpx-2, py-rpx-2, px+rpx+2, py+rpx+2), fill=(255,255,255,255))
-                # miolo na cor do pin
                 pr,pg,pb = (int(pin_color[0:2],16), int(pin_color[2:4],16), int(pin_color[4:6],16))
                 draw.ellipse((px-rpx, py-rpx, px+rpx, py+rpx), fill=(pr,pg,pb,255))
-            # label do pin
             label = f"{lat:.5f}, {lon:.5f}"
             draw_text_with_stroke(draw, (px, py-16*scale), label, fill="white",
                                   stroke_fill="black", stroke_width=2*scale,
                                   font=font, anchor="mb")
 
         # ===== 7) Título CAR + Logo =====
-        IW, IH = img.size  # tamanho real da imagem (já considera @2x)
-
-        # Título CAR (topo-esquerdo)
+        IW, IH = img.size
         if car_text:
             pad_x = int(16 * scale)
             pad_y = int(14 * scale)
@@ -602,17 +570,13 @@ def generate_map():
                 font=font,
                 anchor="la"
             )
-
-        # Logo (topo-direito), dimensionada e posicionada considerando o scale
         try:
             logo = load_logo(logo_url)
             if logo is not None:
-                # usa 30% da largura REAL (IW) para a logo — consistente em 1x e 2x
                 target_w = int(IW * 0.30)
                 w, h = logo.size
                 new_h = int(h * (target_w / float(w)))
                 logo = logo.resize((target_w, new_h), Image.LANCZOS)
-
                 pad_px = int(16 * scale)
                 lx = IW - target_w - pad_px
                 ly = int(12 * scale)
@@ -635,7 +599,6 @@ def generate_map():
             "error": "Falha interna ao gerar mapa.",
             "detail": str(e)
         }), 500
-
 
 @app.get("/health")
 def health():
