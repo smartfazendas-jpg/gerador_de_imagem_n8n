@@ -45,6 +45,9 @@ DEFAULT_JPG_QUALITY  = int(os.getenv("JPG_QUALITY", "82"))
 BRAND_COLOR = os.getenv("BRAND_COLOR", "#346DFF")
 MAX_CONTENT_LENGTH_MB = int(os.getenv("MAX_CONTENT_LENGTH_MB", "8"))
 
+# Aspecto alvo 4:3 (largura:altura)
+TARGET_ASPECT = 4.0 / 3.0
+
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH_MB * 1024 * 1024
 logging.basicConfig(level=logging.INFO)
@@ -203,6 +206,51 @@ def _principal_orientation(geom):
     except Exception:
         return 0.0
 
+# ---- Mercator helpers (para ajuste de aspecto 4:3)
+R_MERC = 6378137.0
+def _merc_x(lon):
+    return math.radians(lon) * R_MERC
+def _merc_y(lat):
+    lat = max(-85.05112878, min(85.05112878, lat))
+    return R_MERC * math.log(math.tan(math.pi/4 + math.radians(lat)/2))
+def _inv_merc_x(x):
+    return math.degrees(x / R_MERC)
+def _inv_merc_y(y):
+    return math.degrees(2*math.atan(math.exp(y / R_MERC)) - math.pi/2)
+
+def _adjust_extent_to_aspect(ext84, target_aspect=TARGET_ASPECT):
+    """
+    Recebe extent em WGS84 [minlon, maxlon, minlat, maxlat]
+    Ajusta para que, em WebMercator (EPSG:3857), width/height == target_aspect,
+    expandindo simetricamente a menor dimensão.
+    """
+    minlon, maxlon, minlat, maxlat = ext84
+    xmin, xmax = _merc_x(minlon), _merc_x(maxlon)
+    ymin, ymax = _merc_y(minlat), _merc_y(maxlat)
+
+    width  = max(1e-9, xmax - xmin)
+    height = max(1e-9, ymax - ymin)
+    cur_aspect = width / height
+
+    if abs(cur_aspect - target_aspect) < 1e-6:
+        return ext84  # já está ok
+
+    if cur_aspect > target_aspect:
+        # muito "largo": precisamos aumentar a altura
+        desired_h = width / target_aspect
+        delta = (desired_h - height) / 2.0
+        ymin -= delta; ymax += delta
+    else:
+        # muito "alto": precisamos aumentar a largura
+        desired_w = height * target_aspect
+        delta = (desired_w - width) / 2.0
+        xmin -= delta; xmax += delta
+
+    # volta pra WGS84
+    minlon2, maxlon2 = _inv_merc_x(xmin), _inv_merc_x(xmax)
+    minlat2, maxlat2 = _inv_merc_y(ymin), _inv_merc_y(ymax)
+    return [minlon2, maxlon2, minlat2, maxlat2]
+
 _LOGO_IMG = None
 def _load_logo(url: str):
     global _LOGO_IMG, requests
@@ -229,6 +277,7 @@ def _add_logo(ax, pil_img, width_px=220):
     imagebox = OffsetImage(pil_img, zoom=zoom)
     ab = AnnotationBbox(imagebox, (0.985, 0.985), xycoords='axes fraction',
                         frameon=False, box_alignment=(1,1), pad=0)
+    ab.set_zorder(1000)  # garante que fica acima da máscara/polígono
     ax.add_artist(ab)
 
 # -------- ocultar eixos/bordas de modo compatível
@@ -314,13 +363,8 @@ def _build_xyz_mosaic(extent_wgs84, z, provider, mapbox_token, tile_size=256):
     crop_bottom = int(py_max - tmin_y * tile_size)
     crop = mosaic.crop((crop_left, crop_top, crop_right, crop_bottom))
 
-    def _merc_x(lon): R=6378137.0; return math.radians(lon)*R
-    def _merc_y(lat):
-        R=6378137.0; lat=max(-85.05112878,min(85.05112878,lat))
-        return R*math.log(math.tan(math.pi/4+math.radians(lat)/2))
-
-    xmin_merc, ymax_merc = _merc_x(minlon), _merc_y(maxlat)
-    xmax_merc, ymin_merc = _merc_x(maxlon), _merc_y(minlat)
+    xmin_merc, xmax_merc = _merc_x(minlon), _merc_x(maxlon)
+    ymin_merc, ymax_merc = _merc_y(minlat), _merc_y(maxlat)
     extent3857 = [xmin_merc, xmax_merc, ymin_merc, ymax_merc]
 
     prov_name = {"google_hybrid":"Google Hybrid",
@@ -363,22 +407,29 @@ def generate_map():
         cod = _extract_cod_imovel(gdf)
         label_text = f"CAR: {cod}" if cod else "CAR"
 
-        # ===== Figura (sem bordas) =====
-        fig = Figure(figsize=(10, 8), dpi=150); fig.set_facecolor("white")
+        # ===== Figura 4:3 (sem bordas) =====
+        fig = Figure(figsize=(12, 9), dpi=150)  # 4:3
+        fig.set_facecolor("white")
         canvas = FigureCanvas(fig)
 
-        # ===== Extent/zoom =====
+        # ===== Extent/zoom inicial =====
         if geom is not None:
             extent84 = _extent_with_padding(geom, pad_ratio=0.10)
-            zoom = _zoom_from_lon_span(extent84[0], extent84[1])
+            # incluir pino no envelope, se houver
             if pin_lat is not None and pin_lon is not None:
                 minx, maxx, miny, maxy = extent84
                 minx = min(minx, pin_lon); maxx = max(maxx, pin_lon)
                 miny = min(miny, pin_lat); maxy = max(maxy, pin_lat)
                 extent84 = [minx, maxx, miny, maxy]
+            # ajusta para 4:3 em Mercator
+            extent84 = _adjust_extent_to_aspect(extent84, TARGET_ASPECT)
+            # recomputa zoom com base no span lon após ajuste
+            zoom = _zoom_from_lon_span(extent84[0], extent84[1])
         elif pin_lat is not None and pin_lon is not None:
             zoom = min(18, max(1, pin_zoom if pin_zoom is not None else 15))
             extent84 = _extent_from_center_zoom(pin_lon, pin_lat, zoom)
+            extent84 = _adjust_extent_to_aspect(extent84, TARGET_ASPECT)
+            zoom = _zoom_from_lon_span(extent84[0], extent84[1])  # readequar
         else:
             return jsonify({"error": "Forneça KML em JSON['data'] ou 'pin_lat' e 'pin_lon' na query."}), 400
 
@@ -469,7 +520,7 @@ def generate_map():
             fig.text(0.015, 0.03, f"{lat:.5f}, {lon:.5f}", fontsize=8, color='white',
                      path_effects=[pe.withStroke(linewidth=2.6, foreground='black')])
 
-        # ===== Atribuição + logo =====
+        # ===== Atribuição + logo (logo sempre por cima) =====
         fig.text(0.012, 0.012, f"© {provider_name}", fontsize=6, color='white',
                  path_effects=[pe.withStroke(linewidth=2.0, foreground='black')])
         _add_logo(ax, _load_logo(logo_url), width_px=220)
