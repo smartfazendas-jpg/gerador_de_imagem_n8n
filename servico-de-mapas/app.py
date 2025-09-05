@@ -385,7 +385,7 @@ def generate_map():
         label_text = f"CAR: {cod}" if cod else "CAR"
 
         # ===== Figura =====
-        fig = Figure(figsize=(10, 8), dpi=150); fig.set_facecolor("white")
+        fig = Figure(figsize=(8, 10), dpi=150); fig.set_facecolor("white")
         canvas = FigureCanvas(fig)
 
         # ===== Extent/zoom =====
