@@ -1,4 +1,4 @@
-import os, io, json, base64, math, logging, requests
+import os, io, json, base64, math, logging, random, requests
 import geopandas as gpd
 import matplotlib
 matplotlib.use('Agg')
@@ -9,29 +9,35 @@ from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 from matplotlib import patheffects as pe
 import cartopy.crs as ccrs
 import cartopy.io.img_tiles as cimgt
-from shapely.geometry import GeometryCollection, box, LineString
+from shapely.geometry import GeometryCollection, box
 from shapely.ops import unary_union
 from PIL import Image
 from flask import Flask, request, send_file, jsonify
 
-# ---------- Config ----------
+# ------------------ Config ------------------
 DEFAULT_PROVIDER = os.getenv("TILE_PROVIDER", "google_hybrid")  # google_hybrid | mapbox_hybrid | osm
-GOOGLE_XYZ_URL   = os.getenv("GOOGLE_XYZ_URL", None)            # ex: https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}
+# Templates do Google Hybrid (XYZ). Requer licença/termos Google.
+GOOGLE_TEMPLATES = [
+    "https://mt0.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+    "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+    "https://mt2.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+    "https://mt3.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+]
 MAPBOX_TOKEN     = os.getenv("MAPBOX_TOKEN", "")
 USER_AGENT       = os.getenv("TILE_USER_AGENT", "SmartFazendas/1.0 (contato@smartfazendas.com.br)")
 DEFAULT_LOGO_URL = os.getenv("LOGO_URL", "https://raw.githubusercontent.com/rodrigocoladello/logomarca/main/Logo%20Smart%20Fazendas%20Roxo.png")
 DEFAULT_DARKEN_ALPHA = float(os.getenv("DARKEN_ALPHA", "0.45"))
 DEFAULT_JPG_QUALITY  = int(os.getenv("JPG_QUALITY", "85"))
-BRAND_COLOR = os.getenv("BRAND_COLOR", "#635AFF")  # roxo SF
+BRAND_COLOR = os.getenv("BRAND_COLOR", "#635AFF")
 MAX_CONTENT_LENGTH_MB = int(os.getenv("MAX_CONTENT_LENGTH_MB", "8"))
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH_MB * 1024 * 1024
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("generate-map")
-_LOGO_IMG = None  # cache em memória
+_LOGO_IMG = None
 
-# ---------- Tiles XYZ genérico ----------
+# ------------------ Tiles ------------------
 class XYZTiles(cimgt.ImageTiles):
     def __init__(self, url_template: str, cache=True, user_agent=None):
         self.url_template = url_template
@@ -40,18 +46,22 @@ class XYZTiles(cimgt.ImageTiles):
         x, y, z = tile
         return self.url_template.format(x=x, y=y, z=z)
 
-def _make_tile_source(provider: str, mapbox_token: str, google_xyz_url: str):
-    if provider == "google_hybrid" and google_xyz_url:
-        return XYZTiles(google_xyz_url, cache=True, user_agent=USER_AGENT), "Google Hybrid"
-    if provider in ("google_hybrid", "mapbox_hybrid") and mapbox_token:
+def _make_tile_source(provider: str):
+    # 1) Google Hybrid (hardcoded)
+    if provider == "google_hybrid":
+        template = random.choice(GOOGLE_TEMPLATES)
+        return XYZTiles(template, cache=True, user_agent=USER_AGENT), "Google Hybrid"
+    # 2) Mapbox Hybrid
+    if provider in ("google_hybrid", "mapbox_hybrid") and MAPBOX_TOKEN:
         mb_url = (
             "https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/tiles/256/"
-            "{z}/{x}/{y}@2x?access_token=" + mapbox_token
+            "{z}/{x}/{y}@2x?access_token=" + MAPBOX_TOKEN
         )
         return XYZTiles(mb_url, cache=True, user_agent=USER_AGENT), "Mapbox Satellite-Streets"
+    # 3) OSM (fallback)
     return cimgt.OSM(cache=True, user_agent=USER_AGENT), "OpenStreetMap"
 
-# ---------- Payload ----------
+# ------------------ Payload ------------------
 def _extract_kml_bytes(payload):
     if payload is None:
         raise ValueError("JSON ausente ou malformado (Content-Type deve ser application/json).")
@@ -81,11 +91,9 @@ def _read_kml_gdf(kml_bytes):
         try:
             return gpd.read_file(bio, driver="KML")
         except Exception as e:
-            raise RuntimeError(
-                "Falha lendo KML (drivers LIBKML/KML indisponíveis). Detalhes: " + str(e)
-            )
+            raise RuntimeError("Falha lendo KML (drivers LIBKML/KML indisponíveis). Detalhes: " + str(e))
 
-# ---------- Geometria / layout ----------
+# ------------------ Geometria / layout ------------------
 def _extent_with_padding(geom, pad_ratio=0.10):
     minx, miny, maxx, maxy = geom.bounds
     dx = (maxx - minx) or 1e-6
@@ -107,21 +115,16 @@ def _extract_cod_imovel(gdf):
     return None
 
 def _principal_orientation(geom):
-    """Calcula o ângulo (em graus) do eixo maior do retângulo mínimo do polígono."""
     try:
         mrr = geom.minimum_rotated_rectangle
         coords = list(mrr.exterior.coords)
-        # quatro lados; pegue o segmento mais longo
         max_len, best_seg = -1, None
         for i in range(4):
-            x1, y1 = coords[i]
-            x2, y2 = coords[(i+1) % 4]
-            length = math.hypot(x2 - x1, y2 - y1)
-            if length > max_len:
-                max_len, best_seg = length, ((x1, y1), (x2, y2))
-        (x1, y1), (x2, y2) = best_seg
-        angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
-        return angle
+            x1,y1 = coords[i]; x2,y2 = coords[(i+1)%4]
+            L = math.hypot(x2-x1, y2-y1)
+            if L > max_len: max_len, best_seg = L, ((x1,y1),(x2,y2))
+        (x1,y1),(x2,y2) = best_seg
+        return math.degrees(math.atan2(y2-y1, x2-x1))
     except Exception:
         return 0.0
 
@@ -140,8 +143,7 @@ def _load_logo(logo_url: str):
         return None
 
 def _add_logo(ax, pil_img, width_px=220):
-    if pil_img is None:
-        return
+    if pil_img is None: return
     w, h = pil_img.size
     zoom = width_px / float(w)
     imagebox = OffsetImage(pil_img, zoom=zoom)
@@ -149,14 +151,11 @@ def _add_logo(ax, pil_img, width_px=220):
                         frameon=False, box_alignment=(1,1), pad=0)
     ax.add_artist(ab)
 
-# ---------- Endpoint ----------
+# ------------------ Endpoints ------------------
 @app.route("/generate-map", methods=["POST"])
 def generate_map():
     try:
-        # Query params ajustáveis
         provider     = request.args.get("provider", DEFAULT_PROVIDER)
-        google_url   = request.args.get("google_url", GOOGLE_XYZ_URL or "")
-        mapbox_token = request.args.get("mapbox_token", MAPBOX_TOKEN or "")
         darken_alpha = float(request.args.get("darken", DEFAULT_DARKEN_ALPHA))
         jpg_quality  = int(request.args.get("jpg_quality", DEFAULT_JPG_QUALITY))
         logo_url     = request.args.get("logo_url", DEFAULT_LOGO_URL)
@@ -164,11 +163,11 @@ def generate_map():
 
         payload = request.get_json(silent=True)
         kml_bytes = _extract_kml_bytes(payload)
-        gdf = _read_kml_gdf(kml_bytes)
+
+        gdf = _read_kml_gdf(kml_bytes).to_crs(4326)
         if gdf.empty or gdf.geometry.isna().all():
             return jsonify({"error":"KML sem geometria válida."}), 400
 
-        gdf = gdf.to_crs(4326)
         geom = unary_union(gdf.geometry)
         if isinstance(geom, GeometryCollection) and geom.is_empty:
             return jsonify({"error":"Geometria vazia."}), 400
@@ -176,7 +175,7 @@ def generate_map():
         cod = _extract_cod_imovel(gdf)
         label_text = f"CAR: {cod}" if cod else "CAR"
 
-        tile_src, provider_name = _make_tile_source(provider, mapbox_token, google_url)
+        tile_src, provider_name = _make_tile_source(provider)
 
         fig = Figure(figsize=(10,8), dpi=150)
         canvas = FigureCanvas(fig)
@@ -201,43 +200,41 @@ def generate_map():
         except Exception as e_mask:
             log.warning(f"Máscara falhou: {e_mask}")
 
-        # Polígono com “borda dupla” (halo escuro + amarelo) usando path effects
-        poly = ax.add_geometries([geom], crs=ccrs.PlateCarree(),
+        # Polígono com halo
+        coll = ax.add_geometries([geom], crs=ccrs.PlateCarree(),
                                  facecolor=(1,1,0,0.25),
                                  edgecolor=(1,1,0,0.95), linewidth=2.2, zorder=7)
-        for artist in poly.get_paths():
-            pass  # necessário para compatibilidade; efeitos aplicados via collection abaixo
-        for coll in ax.collections[-1:]:
-            coll.set_path_effects([pe.Stroke(linewidth=3.8, foreground='black'), pe.Normal()])
+        for c in ax.collections[-1:]:
+            c.set_path_effects([patheffects.Stroke(linewidth=3.8, foreground='black'), patheffects.Normal()])
 
-        # Pino no ponto representativo
+        # Pino
         try:
             pt = geom.representative_point()
             ax.scatter([pt.x], [pt.y], transform=ccrs.PlateCarree(),
                        s=70, zorder=8, marker='o', facecolor=BRAND_COLOR, edgecolor='white', linewidth=1.5)
         except Exception:
-            pass
+            pt = None
 
-        # Rótulo “CAR: …” alinhado ao eixo maior
+        # Rótulo alinhado
         angle = _principal_orientation(geom)
         cx, cy = geom.centroid.x, geom.centroid.y
         txt = ax.text(cx, cy, label_text, transform=ccrs.PlateCarree(),
                       fontsize=10, color='white', rotation=angle, ha='center', va='center', zorder=9)
-        txt.set_path_effects([pe.withStroke(linewidth=2.8, foreground='black')])
+        txt.set_path_effects([patheffects.withStroke(linewidth=2.8, foreground='black')])
 
-        # Coordenadas no canto inferior esquerdo
+        # Coordenadas
         if show_coords:
-            try:
+            if pt is not None:
                 lat, lon = pt.y, pt.x
-            except Exception:
+            else:
                 lat, lon = geom.centroid.y, geom.centroid.x
             fig.text(0.02, 0.06, f"{lat:.5f}, {lon:.5f}", fontsize=8, color='white',
-                     path_effects=[pe.withStroke(linewidth=2.5, foreground='black')])
+                     path_effects=[patheffects.withStroke(linewidth=2.5, foreground='black')])
 
-        # Atribuição + logo
+        # Atribuição e logo
         ax.set_axis_off()
         fig.text(0.01, 0.01, f"© {provider_name}", fontsize=6, color='white',
-                 path_effects=[pe.withStroke(linewidth=2.0, foreground='black')])
+                 path_effects=[patheffects.withStroke(linewidth=2.0, foreground='black')])
         _add_logo(ax, _load_logo(logo_url), width_px=220)
 
         fig.tight_layout(pad=0)
